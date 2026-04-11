@@ -1,9 +1,9 @@
 """
 Computer-Use AI Judging Agent — FastAPI orchestrator.
 
-Unified scoring modes:
-  1. live_url only  → screenshots + Lighthouse + vision scoring
-  2. github_url only → knowledge-graph analysis + code scoring
+Unified scoring modes (0-10 scale, deterministic formulas):
+  1. live_url only  → Lighthouse audit → formula score
+  2. github_url only → knowledge-graph metrics → formula score
   3. both            → runs both pipelines, combines 50/50
 """
 
@@ -31,11 +31,10 @@ load_dotenv()
 
 app = FastAPI(
     title="Computer-Use AI Judge",
-    description="Unified hackathon scoring: live websites, GitHub repos, or both",
-    version="0.2.0",
+    description="Deterministic hackathon scoring: live websites, GitHub repos, or both (0-10 scale)",
+    version="0.3.0",
 )
 
-# Weight each pipeline when both inputs are provided
 LIVE_WEIGHT = 0.5
 CODE_WEIGHT = 0.5
 
@@ -43,7 +42,6 @@ CODE_WEIGHT = 0.5
 # ── Request / Response models ──────────────────────────────────────────
 
 def _validate_live_url(v: str) -> str:
-    """Validate a live URL (SSRF protection)."""
     parsed = urlparse(v)
     if parsed.scheme not in ("http", "https"):
         raise ValueError("URL must use http or https scheme")
@@ -64,8 +62,8 @@ def _validate_live_url(v: str) -> str:
 class EvaluateRequest(BaseModel):
     live_url: str | None = Field(None, description="URL of the live website to evaluate")
     github_url: str | None = Field(None, description="GitHub repository URL to evaluate")
-    self_reported_score: int = Field(
-        ..., ge=0, le=100, description="Participant's self-reported score (0-100)"
+    self_reported_score: float = Field(
+        ..., ge=0, le=10, description="Participant's self-reported score (0-10)"
     )
 
     @model_validator(mode="after")
@@ -94,8 +92,8 @@ class EvaluateRequest(BaseModel):
 
 
 class DimensionScoreResponse(BaseModel):
-    score: int
-    reasoning: str
+    score: float
+    max_score: float
 
 
 class EvaluateResponse(BaseModel):
@@ -103,15 +101,14 @@ class EvaluateResponse(BaseModel):
     live_url: str | None = None
     github_url: str | None = None
     page_title: str | None = None
-    ai_score: int
-    live_score: int | None = None
-    code_score: int | None = None
+    ai_score: float
+    live_score: float | None = None
+    code_score: float | None = None
     live_breakdown: dict[str, DimensionScoreResponse] | None = None
     code_breakdown: dict[str, DimensionScoreResponse] | None = None
-    summary: str
     lighthouse: dict[str, float] | None = None
-    self_reported_score: int
-    delta: int
+    self_reported_score: float
+    delta: float
     honest: bool
     errors: list[str] = Field(default_factory=list)
 
@@ -119,7 +116,6 @@ class EvaluateResponse(BaseModel):
 # ── Live URL scoring pipeline ─────────────────────────────────────────
 
 async def _score_live_url(url: str, errors: list[str]):
-    """Run browser + lighthouse + vision scoring. Returns (score, breakdown, summary, lighthouse, page_title)."""
     logger.info("Starting live URL pipeline for %s", url)
 
     browser_result, lighthouse_result = await asyncio.gather(
@@ -142,14 +138,6 @@ async def _score_live_url(url: str, errors: list[str]):
     if lighthouse_result.error:
         errors.append(f"Lighthouse: {lighthouse_result.error}")
 
-    screenshots_b64 = [
-        {"viewport": s.viewport, "b64_image": s.b64_image}
-        for s in browser_result.screenshots
-        if s.b64_image
-    ]
-    if not screenshots_b64:
-        return None  # fatal — no screenshots
-
     lighthouse_scores = {
         "performance": lighthouse_result.scores.performance,
         "accessibility": lighthouse_result.scores.accessibility,
@@ -157,25 +145,23 @@ async def _score_live_url(url: str, errors: list[str]):
         "seo": lighthouse_result.scores.seo,
     }
 
-    logger.info("Starting vision scoring with %d screenshots", len(screenshots_b64))
-    scorer_result = await asyncio.to_thread(score_website, screenshots_b64, lighthouse_scores)
+    # Deterministic scoring — no LLM, instant
+    scorer_result = score_website(lighthouse_scores)
 
     if scorer_result.error:
-        errors.append(f"Vision scorer: {scorer_result.error}")
-
-    if scorer_result.total_score == 0 and scorer_result.error:
+        errors.append(f"Live scorer: {scorer_result.error}")
         return None
 
-    breakdown = {}
-    for key in ("visual_design", "responsiveness", "ux_interactivity", "performance_accessibility"):
-        dim = getattr(scorer_result, key, None)
-        if dim:
-            breakdown[key] = DimensionScoreResponse(score=dim.score, reasoning=dim.reasoning)
+    breakdown = {
+        "performance": DimensionScoreResponse(score=scorer_result.performance, max_score=2.5),
+        "accessibility": DimensionScoreResponse(score=scorer_result.accessibility, max_score=2.5),
+        "best_practices": DimensionScoreResponse(score=scorer_result.best_practices, max_score=2.5),
+        "seo": DimensionScoreResponse(score=scorer_result.seo, max_score=2.5),
+    }
 
     return {
         "score": scorer_result.total_score,
         "breakdown": breakdown,
-        "summary": scorer_result.summary,
         "lighthouse": lighthouse_scores,
         "page_title": browser_result.page_title,
     }
@@ -184,7 +170,6 @@ async def _score_live_url(url: str, errors: list[str]):
 # ── GitHub code scoring pipeline ──────────────────────────────────────
 
 async def _score_github(github_url: str, errors: list[str]):
-    """Run knowledge-graph analysis + code scoring. Returns (score, breakdown, summary)."""
     logger.info("Starting code pipeline for %s", github_url)
 
     repo_result = await analyze_repo(github_url)
@@ -192,27 +177,34 @@ async def _score_github(github_url: str, errors: list[str]):
         errors.append(f"Code agent: {repo_result.error}")
         return None
 
+    stats = repo_result.stats
     logger.info("Graph analysis done: %s — %d files, %d functions",
-                repo_result.repo_id, repo_result.stats.files_created,
-                repo_result.stats.functions_created)
+                repo_result.repo_id, stats.files_created, stats.functions_created)
 
-    code_result = await asyncio.to_thread(score_codebase, repo_result.graph_summary)
+    # Deterministic scoring — no LLM, instant
+    code_result = score_codebase(
+        files=stats.files_created,
+        functions=stats.functions_created,
+        classes=stats.classes_created,
+        imports=stats.imports_created,
+        endpoints=stats.endpoints_created,
+        calls_edges=stats.calls_edges,
+    )
+
     if code_result.error:
         errors.append(f"Code scorer: {code_result.error}")
-
-    if code_result.total_score == 0 and code_result.error:
         return None
 
-    breakdown = {}
-    for key in ("code_structure", "code_quality", "architecture", "completeness"):
-        dim = getattr(code_result, key, None)
-        if dim:
-            breakdown[key] = DimensionScoreResponse(score=dim.score, reasoning=dim.reasoning)
+    breakdown = {
+        "project_scale": DimensionScoreResponse(score=code_result.project_scale, max_score=3.0),
+        "code_organization": DimensionScoreResponse(score=code_result.code_organization, max_score=2.5),
+        "architecture": DimensionScoreResponse(score=code_result.architecture, max_score=2.5),
+        "connectivity": DimensionScoreResponse(score=code_result.connectivity, max_score=2.0),
+    }
 
     return {
         "score": code_result.total_score,
         "breakdown": breakdown,
-        "summary": code_result.summary,
     }
 
 
@@ -220,7 +212,6 @@ async def _score_github(github_url: str, errors: list[str]):
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(req: EvaluateRequest):
-    """Unified evaluation endpoint — handles live URL, GitHub repo, or both."""
     errors: list[str] = []
 
     has_live = bool(req.live_url)
@@ -229,7 +220,6 @@ async def evaluate(req: EvaluateRequest):
     live_result = None
     code_result = None
 
-    # Run whichever pipelines are needed (in parallel if both)
     if has_live and has_github:
         live_result, code_result = await asyncio.gather(
             _score_live_url(req.live_url, errors),
@@ -240,22 +230,15 @@ async def evaluate(req: EvaluateRequest):
     else:
         code_result = await _score_github(req.github_url, errors)
 
-    # Determine mode and compute final score
     if has_live and has_github:
         mode = "combined"
         if live_result and code_result:
-            ai_score = round(live_result["score"] * LIVE_WEIGHT + code_result["score"] * CODE_WEIGHT)
-            summary = (
-                f"Combined score ({int(LIVE_WEIGHT*100)}% live + {int(CODE_WEIGHT*100)}% code). "
-                f"Live: {live_result['summary']} Code: {code_result['summary']}"
-            )
+            ai_score = round(live_result["score"] * LIVE_WEIGHT + code_result["score"] * CODE_WEIGHT, 1)
         elif live_result:
             ai_score = live_result["score"]
-            summary = f"Only live URL scored (code pipeline failed). {live_result['summary']}"
             errors.append("Code scoring failed — using live URL score only")
         elif code_result:
             ai_score = code_result["score"]
-            summary = f"Only code scored (live URL pipeline failed). {code_result['summary']}"
             errors.append("Live URL scoring failed — using code score only")
         else:
             raise HTTPException(status_code=502, detail=f"Both pipelines failed. Errors: {'; '.join(errors)}")
@@ -264,15 +247,13 @@ async def evaluate(req: EvaluateRequest):
         if not live_result:
             raise HTTPException(status_code=502, detail=f"Live URL scoring failed. Errors: {'; '.join(errors)}")
         ai_score = live_result["score"]
-        summary = live_result["summary"]
     else:
         mode = "github"
         if not code_result:
             raise HTTPException(status_code=502, detail=f"Code scoring failed. Errors: {'; '.join(errors)}")
         ai_score = code_result["score"]
-        summary = code_result["summary"]
 
-    delta = abs(ai_score - req.self_reported_score)
+    delta = round(abs(ai_score - req.self_reported_score), 1)
 
     return EvaluateResponse(
         mode=mode,
@@ -284,7 +265,6 @@ async def evaluate(req: EvaluateRequest):
         code_score=code_result["score"] if code_result else None,
         live_breakdown=live_result["breakdown"] if live_result else None,
         code_breakdown=code_result["breakdown"] if code_result else None,
-        summary=summary,
         lighthouse=live_result["lighthouse"] if live_result else None,
         self_reported_score=req.self_reported_score,
         delta=delta,

@@ -6,16 +6,43 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *.egg-info/
+dist/
+build/
 .venv/
 venv/
+env/
+*.egg
 
 # Environment variables
 .env
+.env.*
 
 # IDE
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 
 # Node
 node_modules/
+package-lock.json
+
+# Next.js
+.next/
+out/
+
+# Lighthouse temp files
+/tmp/lh_*
+
+# Cache
+graph-cache/
+
+# Misc
+*.pem
+*.log
+npm-debug.log*
+yarn-debug.log*
+.vercel
+*.tsbuildinfo
+next-env.d.ts
