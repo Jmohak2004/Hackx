@@ -1,14 +1,20 @@
 import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import { Web3Provider } from "@/providers/Web3Provider";
-import Navbar from "@/components/Navbar";
-import Footer from "@/components/Footer";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
 
 export const metadata: Metadata = {
-  title: "Latent Style Game — AI-Verified Skill Contest",
-  description:
-    "The trustless AI-verified skill contest. Stake ETH, self-declare your score, submit your project, and let AI agents judge. Winners whose scores align with reality split the prize pool.",
-  keywords: ["blockchain", "AI", "game", "ethereum", "staking", "web3", "skill contest"],
+  title: "HackX — Stage",
+  description: "Full-screen stage hero with animated characters",
 };
 
 export default function RootLayout({
@@ -17,19 +23,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body>
-        <Web3Provider>
-          <div className="bg-radial-glow" />
-          <div className="bg-grid" style={{ minHeight: "100vh", position: "relative", zIndex: 1 }}>
-            <Navbar />
-            <main style={{ paddingTop: 72 }}>
-              {children}
-            </main>
-            <Footer />
-          </div>
-        </Web3Provider>
-      </body>
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );
 }
