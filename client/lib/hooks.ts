@@ -16,6 +16,45 @@ import { useState } from "react";
 import { GAME_ABI, GAME_CONTRACT_ADDRESS } from "./contract";
 import { useWallet } from "@/context/WalletContext";
 
+const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
+
+async function ensureWalletOnSepolia() {
+  if (typeof window === "undefined" || !window.ethereum) return;
+
+  const currentChainId = (await window.ethereum.request({
+    method: "eth_chainId",
+  })) as string;
+
+  if (currentChainId?.toLowerCase() === SEPOLIA_CHAIN_ID_HEX) return;
+
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_CHAIN_ID_HEX }],
+    });
+  } catch (err: unknown) {
+    if ((err as { code?: number }).code === 4902) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: SEPOLIA_CHAIN_ID_HEX,
+            chainName: "Sepolia Testnet",
+            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+            rpcUrls: [
+              process.env.NEXT_PUBLIC_RPC_URL ||
+                "https://ethereum-sepolia-rpc.publicnode.com",
+            ],
+            blockExplorerUrls: ["https://sepolia.etherscan.io"],
+          },
+        ],
+      });
+      return;
+    }
+    throw err;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PUBLIC CLIENT  (reads — no wallet needed)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,6 +128,8 @@ function useContractWrite(fnName: string) {
     let hash: `0x${string}`;
 
     try {
+      await ensureWalletOnSepolia();
+
       const walletClient = createWalletClient({
         account: address,
         chain: sepolia,

@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Web3 Test Page</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #0b1020;
+        color: #e5e7eb;
+      }
+      .wrap {
+        max-width: 860px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      h1 {
+        margin: 0 0 16px;
+        font-size: 24px;
+      }
+      .card {
+        background: #111827;
+        border: 1px solid #25314a;
+        border-radius: 10px;
+        padding: 14px;
+        margin-bottom: 14px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 170px 1fr;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+      label {
+        font-size: 13px;
+        color: #9ca3af;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        color: #e5e7eb;
+        padding: 10px;
+        font-size: 14px;
+      }
+      button {
+        background: #0ea5e9;
+        color: #001018;
+        border: 0;
+        border-radius: 8px;
+        font-weight: 700;
+        padding: 10px 12px;
+        cursor: pointer;
+        margin-right: 8px;
+        margin-bottom: 8px;
+      }
+      button.secondary {
+        background: #374151;
+        color: #f3f4f6;
+      }
+      .muted {
+        color: #9ca3af;
+        font-size: 13px;
+      }
+      pre {
+        background: #020617;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 10px;
+        min-height: 140px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Web3 Test Page</h1>
+      <div class="muted">This page is for contract testing only.</div>
+
+      <div class="card">
+        <div class="row">
+          <label for="contractAddress">Contract Address</label>
+          <input id="contractAddress" value="0x36a6f630ad2a5b3bd8fad2d4c30aa3e29079de82" />
+        </div>
+        <div class="row">
+          <label for="rpcUrl">RPC URL (optional)</label>
+          <input id="rpcUrl" value="" placeholder="Leave empty to use injected wallet RPC" />
+        </div>
+      </div>
+
+      <div class="card">
+        <button id="connectBtn">Connect Wallet</button>
+        <button id="switchBtn" class="secondary">Switch To Sepolia</button>
+        <button id="readBtn" class="secondary">Read Contract State</button>
+        <div id="walletInfo" class="muted">Wallet: not connected</div>
+      </div>
+
+      <div class="card">
+        <h3>Create Round (owner only)</h3>
+        <div class="row">
+          <label for="stakeEth">Stake (ETH)</label>
+          <input id="stakeEth" value="0.01" />
+        </div>
+        <div class="row">
+          <label for="tolerance">Tolerance</label>
+          <input id="tolerance" value="5" />
+        </div>
+        <div class="row">
+          <label for="duration">Duration (secs)</label>
+          <input id="duration" value="600" />
+        </div>
+        <div class="row">
+          <label for="buffer">Judging Buffer (secs)</label>
+          <input id="buffer" value="600" />
+        </div>
+        <button id="createRoundBtn">Create Round</button>
+      </div>
+
+      <div class="card">
+        <h3>Enter Game</h3>
+        <div class="row">
+          <label for="selfScore">Self Score</label>
+          <input id="selfScore" value="70" />
+        </div>
+        <div class="row">
+          <label for="githubUrl">GitHub URL</label>
+          <input id="githubUrl" value="https://github.com/example/repo" />
+        </div>
+        <div class="row">
+          <label for="websiteUrl">Website URL</label>
+          <input id="websiteUrl" value="https://example.com" />
+        </div>
+        <button id="enterGameBtn">Enter Game With Round Stake</button>
+      </div>
+
+      <div class="card">
+        <h3>Logs</h3>
+        <pre id="logs"></pre>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js"></script>
+    <script>
+      const ABI = [
+        "function currentRoundId() view returns (uint256)",
+        "function paused() view returns (bool)",
+        "function owner() view returns (address)",
+        "function getRound(uint256) view returns ((uint256 id,uint256 startTime,uint256 endTime,uint256 judgingDeadline,uint256 stakeAmount,uint256 scoreTolerance,uint256 totalPool,uint256 platformFeePool,uint256 winnersCount,bool isActive,bool feesWithdrawn))",
+        "function createRound(uint256 stakeAmount,uint256 scoreTolerance,uint256 durationSecs,uint256 judgingBuffer)",
+        "function enterGame(uint256 selfScore,string githubUrl,string websiteUrl) payable"
+      ];
+
+      const chainHex = "0xaa36a7";
+
+      const logs = document.getElementById("logs");
+      const walletInfo = document.getElementById("walletInfo");
+
+      function log(message, data) {
+        const line = data !== undefined ? `${message} ${JSON.stringify(data, null, 2)}` : message;
+        logs.textContent += line + "\n";
+        logs.scrollTop = logs.scrollHeight;
+      }
+
+      function getAddress() {
+        return document.getElementById("contractAddress").value.trim();
+      }
+
+      async function getInjectedProvider() {
+        if (!window.ethereum) throw new Error("No wallet detected. Install MetaMask.");
+        return new ethers.BrowserProvider(window.ethereum);
+      }
+
+      async function switchToSepolia() {
+        if (!window.ethereum) throw new Error("No wallet detected.");
+        try {
+          await window.ethereum.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: chainHex }],
+          });
+        } catch (err) {
+          if (err && err.code === 4902) {
+            await window.ethereum.request({
+              method: "wallet_addEthereumChain",
+              params: [{
+                chainId: chainHex,
+                chainName: "Sepolia Testnet",
+                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                rpcUrls: ["https://ethereum-sepolia-rpc.publicnode.com"],
+                blockExplorerUrls: ["https://sepolia.etherscan.io"]
+              }]
+            });
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      async function connectWallet() {
+        const provider = await getInjectedProvider();
+        await provider.send("eth_requestAccounts", []);
+        const signer = await provider.getSigner();
+        const network = await provider.getNetwork();
+        walletInfo.textContent = `Wallet: ${signer.address} | Chain: ${network.chainId}`;
+        log("Connected wallet:", { address: signer.address, chainId: network.chainId.toString() });
+      }
+
+      async function readState() {
+        const provider = await getInjectedProvider();
+        const contract = new ethers.Contract(getAddress(), ABI, provider);
+
+        const roundId = await contract.currentRoundId();
+        const paused = await contract.paused();
+        const owner = await contract.owner();
+
+        const state = {
+          contract: getAddress(),
+          roundId: roundId.toString(),
+          paused,
+          owner,
+        };
+
+        if (roundId > 0n) {
+          const round = await contract.getRound(roundId);
+          state.round = {
+            id: round.id.toString(),
+            isActive: round.isActive,
+            stakeAmountWei: round.stakeAmount.toString(),
+            stakeAmountEth: ethers.formatEther(round.stakeAmount),
+            scoreTolerance: round.scoreTolerance.toString(),
+            totalPoolEth: ethers.formatEther(round.totalPool),
+          };
+        }
+
+        log("Contract state:", state);
+      }
+
+      async function createRound() {
+        const provider = await getInjectedProvider();
+        await switchToSepolia();
+
+        const signer = await provider.getSigner();
+        const contract = new ethers.Contract(getAddress(), ABI, signer);
+
+        const stakeEth = document.getElementById("stakeEth").value.trim();
+        const tolerance = BigInt(document.getElementById("tolerance").value.trim());
+        const duration = BigInt(document.getElementById("duration").value.trim());
+        const buffer = BigInt(document.getElementById("buffer").value.trim());
+
+        const tx = await contract.createRound(
+          ethers.parseEther(stakeEth),
+          tolerance,
+          duration,
+          buffer
+        );
+        log("createRound tx sent:", { hash: tx.hash });
+
+        const receipt = await tx.wait();
+        log("createRound confirmed:", { hash: receipt.hash, block: receipt.blockNumber });
+      }
+
+      async function enterGame() {
+        const provider = await getInjectedProvider();
+        await switchToSepolia();
+
+        const signer = await provider.getSigner();
+        const contract = new ethers.Contract(getAddress(), ABI, signer);
+
+        const roundId = await contract.currentRoundId();
+        if (roundId === 0n) {
+          throw new Error("No active round id. Create a round first.");
+        }
+
+        const round = await contract.getRound(roundId);
+        const selfScore = BigInt(document.getElementById("selfScore").value.trim());
+        const githubUrl = document.getElementById("githubUrl").value.trim();
+        const websiteUrl = document.getElementById("websiteUrl").value.trim();
+
+        const tx = await contract.enterGame(selfScore, githubUrl, websiteUrl, {
+          value: round.stakeAmount,
+        });
+        log("enterGame tx sent:", { hash: tx.hash, stakeWei: round.stakeAmount.toString() });
+
+        const receipt = await tx.wait();
+        log("enterGame confirmed:", { hash: receipt.hash, block: receipt.blockNumber });
+      }
+
+      async function safeRun(fn) {
+        try {
+          await fn();
+        } catch (err) {
+          const message = err && err.message ? err.message : String(err);
+          log("ERROR:", { message });
+        }
+      }
+
+      document.getElementById("connectBtn").addEventListener("click", () => safeRun(connectWallet));
+      document.getElementById("switchBtn").addEventListener("click", () => safeRun(switchToSepolia));
+      document.getElementById("readBtn").addEventListener("click", () => safeRun(readState));
+      document.getElementById("createRoundBtn").addEventListener("click", () => safeRun(createRound));
+      document.getElementById("enterGameBtn").addEventListener("click", () => safeRun(enterGame));
+
+      log("Ready. Connect wallet to begin.");
+    </script>
+  </body>
+</html>
