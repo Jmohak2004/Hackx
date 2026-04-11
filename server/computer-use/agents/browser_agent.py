@@ -33,6 +33,9 @@ class BrowserAgentResult:
     url: str
     screenshots: list[ScreenshotResult] = field(default_factory=list)
     page_title: str = ""
+    meta_description: str = ""
+    headings: list[str] = field(default_factory=list)  # first few h1/h2 texts
+    hero_text: str = ""  # visible text from the hero/above-fold area
     error: str | None = None
 
 
@@ -55,6 +58,28 @@ async def capture_screenshots(url: str) -> BrowserAgentResult:
                     # Grab page title once
                     if not result.page_title:
                         result.page_title = await page.title()
+
+                    # Extract website content for commentary (first viewport only)
+                    if not result.meta_description:
+                        result.meta_description = await page.evaluate(
+                            """() => {
+                                const el = document.querySelector('meta[name="description"]');
+                                return el ? el.getAttribute('content') || '' : '';
+                            }"""
+                        )
+                        result.headings = await page.evaluate(
+                            """() => {
+                                const hs = [...document.querySelectorAll('h1, h2')].slice(0, 8);
+                                return hs.map(h => h.innerText.trim()).filter(t => t.length > 0);
+                            }"""
+                        )
+                        result.hero_text = await page.evaluate(
+                            """() => {
+                                const el = document.querySelector('main, [role="main"], .hero, #hero, header');
+                                if (!el) return '';
+                                return el.innerText.substring(0, 500).trim();
+                            }"""
+                        )
 
                     # Scroll to bottom and back to trigger lazy-loaded content
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
