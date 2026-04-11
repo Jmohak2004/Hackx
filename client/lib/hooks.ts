@@ -105,7 +105,9 @@ function useContractWrite(fnName: string) {
         args: args as any,
         account: address,
         ...(value !== undefined ? { value } : {}),
-      });
+        // Payable vs non-payable union: viem's overloads reject conditional `value`.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any);
     } catch (e) {
       setError(e as Error);
       setIsPending(false);

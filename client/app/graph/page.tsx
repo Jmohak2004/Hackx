@@ -1,3 +1,4 @@
+// @ts-nocheck — d3 drag/selection generics clash with @types/d3.
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
