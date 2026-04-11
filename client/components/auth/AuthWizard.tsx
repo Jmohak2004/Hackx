@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useConnect, useConnectors, useConnection } from "wagmi";
+import { useConnect, useConnectors, useAccount } from "wagmi";
 import { runWelcomeConfetti } from "./celebrate";
 
 /** Three sequential plays (left panel). Uses one file three times until load_2.mp4 / load_3.mp4 exist in public/images. */
@@ -145,22 +145,20 @@ function ProcessingLoader({
             return (
               <li
                 key={phase.title}
-                className={`flex gap-4 rounded-xl border px-4 py-3.5 transition-colors ${
-                  active
+                className={`flex gap-4 rounded-xl border px-4 py-3.5 transition-colors ${active
                     ? "border-amber-400/35 bg-amber-500/10"
                     : done
                       ? "border-white/10 bg-white/[0.04]"
                       : "border-white/[0.06] bg-black/20 opacity-60"
-                }`}
+                  }`}
               >
                 <span
-                  className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${
-                    done
+                  className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${done
                       ? "bg-emerald-500/25 text-emerald-300"
                       : active
                         ? "bg-amber-400/20 text-amber-200"
                         : "bg-white/10 text-white/40"
-                  }`}
+                    }`}
                   aria-hidden
                 >
                   {done ? "✓" : i + 1}
@@ -199,7 +197,7 @@ export function AuthWizard() {
   const [profileError, setProfileError] = useState("");
   const [scoreError, setScoreError] = useState("");
 
-  const { address, isConnected, status } = useConnection();
+  const { address, isConnected, status } = useAccount();
   const connectors = useConnectors();
   const {
     mutate: connectWallet,
@@ -359,9 +357,8 @@ export function AuthWizard() {
                     >
                       {i > 0 ? (
                         <div
-                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${
-                            step > STEPS[i - 1]!.n ? "bg-amber-500/50" : "bg-white/10"
-                          }`}
+                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${step > STEPS[i - 1]!.n ? "bg-amber-500/50" : "bg-white/10"
+                            }`}
                           aria-hidden
                         />
                       ) : (
@@ -369,37 +366,34 @@ export function AuthWizard() {
                       )}
                       <div className="flex shrink-0 flex-col items-center gap-2 px-2">
                         <span
-                          className={`flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold transition-all duration-300 ${
-                            step === item.n
+                          className={`flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold transition-all duration-300 ${step === item.n
                               ? "bg-amber-400 text-zinc-950 ring-2 ring-amber-200/50 shadow-[0_0_20px_rgba(251,191,36,0.35)]"
                               : step > item.n
                                 ? "border border-amber-500/40 bg-amber-600/25 text-amber-100"
                                 : "border border-white/10 bg-black/30 text-white/40"
-                          }`}
+                            }`}
                         >
                           {step > item.n ? (
                             <svg className="h-4 w-4" viewBox="0 0 16 16" fill="none">
-                              <path d="M3 8l3.5 3.5L13 5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
+                              <path d="M3 8l3.5 3.5L13 5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
                             </svg>
                           ) : item.n}
                         </span>
                         <span
-                          className={`text-[0.65rem] font-medium uppercase tracking-wide transition-colors duration-300 sm:text-[11px] ${
-                            step === item.n
+                          className={`text-[0.65rem] font-medium uppercase tracking-wide transition-colors duration-300 sm:text-[11px] ${step === item.n
                               ? "text-amber-200/90"
                               : step > item.n
                                 ? "text-amber-100/55"
                                 : "text-white/30"
-                          }`}
+                            }`}
                         >
                           {item.label}
                         </span>
                       </div>
                       {i < STEPS.length - 1 ? (
                         <div
-                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${
-                            step > item.n ? "bg-amber-500/50" : "bg-white/10"
-                          }`}
+                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${step > item.n ? "bg-amber-500/50" : "bg-white/10"
+                            }`}
                           aria-hidden
                         />
                       ) : (
@@ -578,8 +572,8 @@ export function AuthWizard() {
                               >
                                 {isThis && (
                                   <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                                   </svg>
                                 )}
                                 {isThis ? "Connecting…" : `Connect ${connector.name}`}
@@ -601,7 +595,7 @@ export function AuthWizard() {
                     {isConnected && address && (
                       <div className="flex items-center justify-center gap-2 rounded-xl border border-emerald-500/20 bg-emerald-500/8 px-5 py-3.5">
                         <svg className="h-4 w-4 text-emerald-400" viewBox="0 0 16 16" fill="none">
-                          <path d="M3 8l3.5 3.5L13 5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/>
+                          <path d="M3 8l3.5 3.5L13 5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
                         </svg>
                         <p className="text-sm text-emerald-300">
                           Wallet linked — taking you in…
