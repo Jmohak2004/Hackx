@@ -16,6 +16,11 @@ env/
 # Environment variables
 .env
 .env.*
+.venv/
+venv/
+
+# Environment variables
+.env
 
 # IDE
 .vscode/
@@ -46,3 +51,6 @@ yarn-debug.log*
 .vercel
 *.tsbuildinfo
 next-env.d.ts
+
+# Node
+node_modules/
