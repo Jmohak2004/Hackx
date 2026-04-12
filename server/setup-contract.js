@@ -11,7 +11,7 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
 
-const CONTRACT_ADDRESS = "0x13a8638041b2825937756e19b775536c0150f429";
+const CONTRACT_ADDRESS = "0xcf5f572a03a9054d623fa28d66e51af50ccd2f77";
 const AGENT_ADDRESS = "0x65Fa1E64D9308435dF1E190176259d3BC74CFCEF";
 
 const SEPOLIA_RPC =
