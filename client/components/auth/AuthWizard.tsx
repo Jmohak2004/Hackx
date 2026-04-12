@@ -5,7 +5,146 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useConnect, useConnectors, useAccount } from "wagmi";
+import {
+  createPublicClient,
+  createWalletClient,
+  custom,
+  http,
+  fallback,
+  parseEventLogs,
+  type Address,
+} from "viem";
+import { sepolia } from "viem/chains";
+import { GAME_ABI, GAME_CONTRACT_ADDRESS } from "@/lib/contract";
 import { runWelcomeConfetti } from "./celebrate";
+
+// ──────────────────────────────────────────────────────────────────────────��──
+// BLOCKCHAIN HELPERS
+// ───────────────────────────────────────────────────────────────────────────���─
+
+const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
+
+const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL;
+
+const viemPublicClient = createPublicClient({
+  chain: sepolia,
+  transport: rpcUrl
+    ? http(rpcUrl)
+    : fallback([
+        http("https://ethereum-sepolia-rpc.publicnode.com"),
+        http("https://sepolia.drpc.org"),
+      ]),
+});
+
+const SERVER_API_BASE =
+  process.env.NEXT_PUBLIC_SERVER_URL ?? "http://localhost:4000";
+
+async function ensureWalletOnSepolia() {
+  if (typeof window === "undefined" || !window.ethereum) return;
+  const currentChainId = (await window.ethereum.request({
+    method: "eth_chainId",
+  })) as string;
+  if (currentChainId?.toLowerCase() === SEPOLIA_CHAIN_ID_HEX) return;
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_CHAIN_ID_HEX }],
+    });
+  } catch (err: unknown) {
+    if ((err as { code?: number }).code === 4902) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: SEPOLIA_CHAIN_ID_HEX,
+            chainName: "Sepolia Testnet",
+            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+            rpcUrls: [rpcUrl || "https://ethereum-sepolia-rpc.publicnode.com"],
+            blockExplorerUrls: ["https://sepolia.etherscan.io"],
+          },
+        ],
+      });
+    } else {
+      throw err;
+    }
+  }
+}
+
+/**
+ * Call enterGame on the contract, staking ETH.
+ * Returns the entryId from the EntrySubmitted event.
+ */
+async function stakeAndEnterGame(
+  walletAddress: Address,
+  selfScore: number,
+  githubUrl: string,
+  websiteUrl: string,
+  stakeAmountWei: bigint
+): Promise<{ entryId: bigint; txHash: string }> {
+  await ensureWalletOnSepolia();
+
+  const walletClient = createWalletClient({
+    account: walletAddress,
+    chain: sepolia,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    transport: custom(window.ethereum as any),
+  });
+
+  // selfScore is 1-10 from UI, contract expects 0-100
+  const contractScore = BigInt(selfScore * 10);
+
+  const hash = await walletClient.writeContract({
+    address: GAME_CONTRACT_ADDRESS,
+    abi: GAME_ABI,
+    functionName: "enterGame",
+    args: [contractScore, githubUrl, websiteUrl],
+    value: stakeAmountWei,
+  });
+
+  const receipt = await viemPublicClient.waitForTransactionReceipt({ hash });
+
+  // Parse EntrySubmitted event to get entryId
+  const logs = parseEventLogs({
+    abi: GAME_ABI,
+    logs: receipt.logs,
+    eventName: "EntrySubmitted",
+  });
+
+  if (logs.length === 0) {
+    throw new Error("EntrySubmitted event not found in transaction receipt");
+  }
+
+  const entryId = (logs[0] as { args: { entryId: bigint } }).args.entryId;
+
+  return { entryId, txHash: hash };
+}
+
+/**
+ * Call claimPrize on the contract from the user's wallet.
+ */
+async function claimPrizeOnChain(
+  walletAddress: Address,
+  entryId: bigint
+): Promise<string> {
+  await ensureWalletOnSepolia();
+
+  const walletClient = createWalletClient({
+    account: walletAddress,
+    chain: sepolia,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    transport: custom(window.ethereum as any),
+  });
+
+  const hash = await walletClient.writeContract({
+    address: GAME_CONTRACT_ADDRESS,
+    abi: GAME_ABI,
+    functionName: "claimPrize",
+    args: [entryId],
+  });
+
+  await viemPublicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
 
 /** Three sequential plays (left panel). Uses one file three times until load_2.mp4 / load_3.mp4 exist in public/images. */
 const LOADER_CLIPS = [
@@ -75,11 +214,17 @@ function ProcessingLoader({
   githubUrl,
   hostedUrl,
   selfScore,
+  walletAddress,
+  entryId,
+  roundId,
   onComplete,
 }: {
   githubUrl: string;
   hostedUrl: string;
   selfScore: number;
+  walletAddress: Address | undefined;
+  entryId: bigint | null;
+  roundId: bigint | null;
   onComplete: () => void;
 }) {
   const router = useRouter();
@@ -112,10 +257,12 @@ function ProcessingLoader({
       pushLog(`[UI] github_url=${githubUrl}`);
       pushLog(`[UI] hosted_url=${hostedUrl}`);
       pushLog(`[UI] self_score=${selfScore}`);
+      if (entryId) pushLog(`[Chain] On-chain entryId=${entryId.toString()}`);
 
       setPhaseStatuses(["active", "pending", "pending"]);
 
       try {
+        // ── Phase 1: AI Scoring ─────────────────────────────────────────
         const resp = await fetch(`${AI_API_BASE}/score`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -150,14 +297,98 @@ function ProcessingLoader({
 
         setPhaseStatuses(["done", "done", "active"]);
         pushLog(`[UI] Scores received — user=${data.user_score} ai=${data.ai_score} github=${data.github_score} avg=${data.avg_score}`);
+
+        // ── Phase 2: On-chain score verification ────────────────────────
+        let chainResult: {
+          txHash?: string;
+          isWinner?: boolean;
+          claimTxHash?: string;
+        } = {};
+
+        if (entryId && walletAddress) {
+          pushLog(`[Chain] Submitting verified score on-chain…`);
+          // AI score is 1-10, contract expects 0-100
+          const verifiedScore100 = Math.round(data.ai_score * 10);
+
+          try {
+            const scoreResp = await fetch(
+              `${SERVER_API_BASE}/api/blockchain/submit-score`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  entryId: entryId.toString(),
+                  verifiedScore: verifiedScore100,
+                  proofHash: `score-${data.ai_score}-${Date.now()}`,
+                }),
+              }
+            );
+
+            if (!scoreResp.ok) {
+              const errText = await scoreResp.text();
+              pushLog(`[Chain] WARNING: Score submission failed — ${errText}`);
+            } else {
+              const scoreData = await scoreResp.json();
+              chainResult.txHash = scoreData.txHash;
+              chainResult.isWinner = scoreData.isWinner;
+              pushLog(
+                `[Chain] Score verified on-chain! tx=${scoreData.txHash}`
+              );
+              pushLog(
+                `[Chain] Winner: ${scoreData.isWinner ? "YES" : "NO"}`
+              );
+
+              // ── Phase 3: Auto-claim prize if winner ───────────────────
+              if (scoreData.isWinner && walletAddress) {
+                pushLog(`[Chain] You won! Claiming prize to your wallet…`);
+                try {
+                  const claimHash = await claimPrizeOnChain(
+                    walletAddress,
+                    entryId
+                  );
+                  chainResult.claimTxHash = claimHash;
+                  pushLog(
+                    `[Chain] Prize claimed! tx=${claimHash}`
+                  );
+                } catch (claimErr: unknown) {
+                  const claimMsg =
+                    claimErr instanceof Error
+                      ? claimErr.message
+                      : String(claimErr);
+                  pushLog(`[Chain] Prize claim failed: ${claimMsg}`);
+                  pushLog(
+                    `[Chain] You can claim manually later with entryId=${entryId.toString()}`
+                  );
+                }
+              }
+            }
+          } catch (chainErr: unknown) {
+            const chainMsg =
+              chainErr instanceof Error ? chainErr.message : String(chainErr);
+            pushLog(`[Chain] Score submission error: ${chainMsg}`);
+          }
+        }
+
         pushLog(`[UI] user_wins=${data.user_wins}  Redirecting to results page…`);
 
         await new Promise((r) => setTimeout(r, 800));
         setPhaseStatuses(["done", "done", "done"]);
 
+        // Merge blockchain data into score result
+        const enrichedData = {
+          ...data,
+          chain: {
+            entryId: entryId?.toString() ?? null,
+            roundId: roundId?.toString() ?? null,
+            scoreTxHash: chainResult.txHash ?? null,
+            isWinnerOnChain: chainResult.isWinner ?? null,
+            claimTxHash: chainResult.claimTxHash ?? null,
+          },
+        };
+
         // Navigate to /score with result encoded
         const params = new URLSearchParams({
-          d: encodeURIComponent(JSON.stringify(data)),
+          d: encodeURIComponent(JSON.stringify(enrichedData)),
         });
         router.push(`/score?${params.toString()}`);
       } catch (err: unknown) {
@@ -171,7 +402,7 @@ function ProcessingLoader({
     }
 
     runPipeline();
-  }, [githubUrl, hostedUrl, selfScore, pushLog, router]);
+  }, [githubUrl, hostedUrl, selfScore, walletAddress, entryId, roundId, pushLog, router]);
 
   const handleEnded = useCallback(() => {
     const i = clipIndexRef.current;
@@ -323,6 +554,12 @@ export function AuthWizard() {
   const [profileError, setProfileError] = useState("");
   const [scoreError, setScoreError] = useState("");
 
+  // Blockchain staking state
+  const [isStaking, setIsStaking] = useState(false);
+  const [stakeError, setStakeError] = useState("");
+  const [entryId, setEntryId] = useState<bigint | null>(null);
+  const [currentRoundId, setCurrentRoundId] = useState<bigint | null>(null);
+
   const { address, isConnected, status } = useAccount();
   const connectors = useConnectors();
   const {
@@ -385,6 +622,88 @@ export function AuthWizard() {
     setStep(3);
   }
 
+  /**
+   * Stake ETH and enter the game on-chain, then advance to analysis.
+   */
+  async function handleAnalyzeClick() {
+    if (!address || !window.ethereum) {
+      setStakeError("Wallet not connected. Please go back and connect.");
+      return;
+    }
+
+    setIsStaking(true);
+    setStakeError("");
+
+    try {
+      // Read current round from the contract
+      const roundIdRaw = await viemPublicClient.readContract({
+        address: GAME_CONTRACT_ADDRESS,
+        abi: GAME_ABI,
+        functionName: "currentRoundId",
+      });
+      const roundId = roundIdRaw as bigint;
+
+      if (roundId === 0n) {
+        setStakeError("No active game round. Please wait for a round to start.");
+        setIsStaking(false);
+        return;
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const roundData = (await viemPublicClient.readContract({
+        address: GAME_CONTRACT_ADDRESS,
+        abi: GAME_ABI,
+        functionName: "getRound",
+        args: [roundId],
+      })) as { stakeAmount: bigint; isActive: boolean; endTime: bigint };
+
+      if (!roundData.isActive) {
+        setStakeError("Current round is not active. Please wait for a new round.");
+        setIsStaking(false);
+        return;
+      }
+
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      if (now > roundData.endTime) {
+        setStakeError("Submission period has ended for this round.");
+        setIsStaking(false);
+        return;
+      }
+
+      setCurrentRoundId(roundId);
+
+      const selfScore = Number(score.trim()) || 1;
+      const stakeWei = roundData.stakeAmount;
+
+      const { entryId: newEntryId } = await stakeAndEnterGame(
+        address,
+        selfScore,
+        githubUrl.trim(),
+        hostedUrl.trim() || githubUrl.trim(), // websiteUrl required by contract
+        stakeWei
+      );
+
+      setEntryId(newEntryId);
+      setIsStaking(false);
+      setStep(5); // Proceed to analysis
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // User rejected in MetaMask
+      if (msg.includes("User rejected") || msg.includes("user rejected")) {
+        setStakeError("Transaction was rejected. Click again to retry.");
+      } else if (msg.includes("AlreadyEntered")) {
+        // User already entered this round — skip staking, proceed to analysis
+        setStakeError("");
+        setIsStaking(false);
+        setStep(5);
+        return;
+      } else {
+        setStakeError(`Staking failed: ${msg.slice(0, 200)}`);
+      }
+      setIsStaking(false);
+    }
+  }
+
   const scoreNum = Number(score.trim());
   const scoreValid =
     score.trim() !== "" &&
@@ -421,6 +740,9 @@ export function AuthWizard() {
           githubUrl={githubUrl}
           hostedUrl={hostedUrl}
           selfScore={Number(score.trim()) || 1}
+          walletAddress={address}
+          entryId={entryId}
+          roundId={currentRoundId}
           onComplete={() => router.push("/")}
         />
       ) : step === 4 ? (
@@ -443,13 +765,21 @@ export function AuthWizard() {
             </p>
             <button
               type="button"
-              onClick={() => setStep(5)}
+              disabled={isStaking}
+              onClick={handleAnalyzeClick}
               className={`${btnPrimaryClass} mt-10 w-full max-w-sm`}
             >
-              Analyze my project
+              {isStaking ? "Staking ETH…" : "Analyze my project"}
             </button>
+            {stakeError && (
+              <p className="mt-3 max-w-sm rounded-lg bg-red-500/10 border border-red-400/20 px-4 py-2.5 text-sm text-red-300" role="alert">
+                {stakeError}
+              </p>
+            )}
             <p className="mt-4 max-w-sm text-xs text-amber-100/50">
-              Next we&apos;ll process your GitHub and hosted links while the loader runs.
+              {isStaking
+                ? "Confirm the transaction in your wallet to stake ETH and enter the game."
+                : "Next we\u2019ll stake your entry and process your GitHub and hosted links."}
             </p>
           </div>
         </div>
