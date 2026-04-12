@@ -66,36 +66,122 @@ function isValidOptionalHostedUrl(raw: string): boolean {
   }
 }
 
+const AI_API_BASE =
+  process.env.NEXT_PUBLIC_AI_API_URL ?? "http://localhost:8000";
+
+type PhaseStatus = "pending" | "active" | "done" | "error";
+
 function ProcessingLoader({
   githubUrl,
   hostedUrl,
+  selfScore,
   onComplete,
 }: {
   githubUrl: string;
   hostedUrl: string;
+  selfScore: number;
   onComplete: () => void;
 }) {
+  const router = useRouter();
   const [clipIndex, setClipIndex] = useState(0);
   const clipIndexRef = useRef(0);
   clipIndexRef.current = clipIndex;
 
+  const [phaseStatuses, setPhaseStatuses] = useState<PhaseStatus[]>([
+    "active", "pending", "pending",
+  ]);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [apiError, setApiError] = useState<string | null>(null);
+  const hasCalled = useRef(false);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
+  const pushLog = useCallback((msg: string) => {
+    setLogs((prev) => [...prev, msg]);
+  }, []);
+
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  useEffect(() => {
+    if (hasCalled.current) return;
+    hasCalled.current = true;
+
+    async function runPipeline() {
+      pushLog(`[UI] Calling AI scoring API at ${AI_API_BASE}/score`);
+      pushLog(`[UI] github_url=${githubUrl}`);
+      pushLog(`[UI] hosted_url=${hostedUrl}`);
+      pushLog(`[UI] self_score=${selfScore}`);
+
+      setPhaseStatuses(["active", "pending", "pending"]);
+
+      try {
+        const resp = await fetch(`${AI_API_BASE}/score`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            github_url: githubUrl,
+            hosted_url: hostedUrl,
+            self_score: selfScore,
+          }),
+        });
+
+        setPhaseStatuses(["done", "active", "pending"]);
+        pushLog(`[UI] API responded with status ${resp.status}`);
+
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error(`API error ${resp.status}: ${errText.slice(0, 300)}`);
+        }
+
+        const data = await resp.json();
+
+        // Stream logs from API response into the UI console
+        if (Array.isArray(data.logs)) {
+          for (const line of data.logs as string[]) {
+            pushLog(line);
+          }
+        }
+        if (Array.isArray(data.errors) && data.errors.length > 0) {
+          for (const e of data.errors as string[]) {
+            pushLog(`[WARN] ${e}`);
+          }
+        }
+
+        setPhaseStatuses(["done", "done", "active"]);
+        pushLog(`[UI] Scores received — user=${data.user_score} ai=${data.ai_score} github=${data.github_score} avg=${data.avg_score}`);
+        pushLog(`[UI] user_wins=${data.user_wins}  Redirecting to results page…`);
+
+        await new Promise((r) => setTimeout(r, 800));
+        setPhaseStatuses(["done", "done", "done"]);
+
+        // Navigate to /score with result encoded
+        const params = new URLSearchParams({
+          d: encodeURIComponent(JSON.stringify(data)),
+        });
+        router.push(`/score?${params.toString()}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        pushLog(`[ERROR] ${msg}`);
+        setApiError(msg);
+        setPhaseStatuses((prev) =>
+          prev.map((s) => (s === "active" ? "error" : s))
+        );
+      }
+    }
+
+    runPipeline();
+  }, [githubUrl, hostedUrl, selfScore, pushLog, router]);
+
   const handleEnded = useCallback(() => {
     const i = clipIndexRef.current;
-    if (i < LOADER_CLIPS.length - 1) {
-      setClipIndex(i + 1);
-    } else {
-      onComplete();
-    }
-  }, [onComplete]);
+    if (i < LOADER_CLIPS.length - 1) setClipIndex(i + 1);
+  }, []);
 
   const handleError = useCallback(() => {
     const i = clipIndexRef.current;
-    if (i < LOADER_CLIPS.length - 1) {
-      setClipIndex(i + 1);
-    } else {
-      onComplete();
-    }
-  }, [onComplete]);
+    if (i < LOADER_CLIPS.length - 1) setClipIndex(i + 1);
+  }, []);
 
   return (
     <div className="relative z-20 flex min-h-dvh w-full flex-col bg-zinc-950/90 md:flex-row">
@@ -138,30 +224,38 @@ function ProcessingLoader({
           {hostedUrl.trim() ? " and hosted URL" : ""}. This usually takes a moment.
         </p>
 
-        <ul className="mt-10 flex max-w-lg flex-col gap-4" aria-label="Analysis progress">
+        <ul className="mt-8 flex max-w-lg flex-col gap-3" aria-label="Analysis progress">
           {ANALYSIS_PHASES.map((phase, i) => {
-            const done = i < clipIndex;
-            const active = i === clipIndex;
+            const status = phaseStatuses[i] ?? "pending";
             return (
               <li
                 key={phase.title}
-                className={`flex gap-4 rounded-xl border px-4 py-3.5 transition-colors ${active
-                    ? "border-amber-400/35 bg-amber-500/10"
-                    : done
-                      ? "border-white/10 bg-white/[0.04]"
+                className={`flex gap-4 rounded-xl border px-4 py-3.5 transition-colors ${status === "active"
+                  ? "border-amber-400/35 bg-amber-500/10"
+                  : status === "done"
+                    ? "border-emerald-500/20 bg-white/[0.04]"
+                    : status === "error"
+                      ? "border-red-400/30 bg-red-500/10"
                       : "border-white/[0.06] bg-black/20 opacity-60"
                   }`}
               >
                 <span
-                  className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${done
-                      ? "bg-emerald-500/25 text-emerald-300"
-                      : active
-                        ? "bg-amber-400/20 text-amber-200"
+                  className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${status === "done"
+                    ? "bg-emerald-500/25 text-emerald-300"
+                    : status === "active"
+                      ? "bg-amber-400/20 text-amber-200"
+                      : status === "error"
+                        ? "bg-red-500/20 text-red-300"
                         : "bg-white/10 text-white/40"
                     }`}
                   aria-hidden
                 >
-                  {done ? "✓" : i + 1}
+                  {status === "done" ? "✓" : status === "error" ? "✕" : status === "active" ? (
+                    <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                  ) : i + 1}
                 </span>
                 <div className="min-w-0">
                   <p className="font-medium text-zinc-100">{phase.title}</p>
@@ -172,12 +266,44 @@ function ProcessingLoader({
           })}
         </ul>
 
-        <div className="mt-8 rounded-xl border border-white/[0.08] bg-black/30 px-4 py-3 text-xs text-zinc-500">
+        {apiError && (
+          <div className="mt-4 rounded-xl border border-red-400/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+            <p className="font-semibold">Scoring error — details below</p>
+            <p className="mt-1 font-mono text-xs break-all">{apiError}</p>
+          </div>
+        )}
+
+        {/* Live log console */}
+        <div className="mt-6 max-h-48 overflow-y-auto rounded-xl border border-white/[0.08] bg-black/40 px-4 py-3 text-xs">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-600">Pipeline logs</p>
+          {logs.length === 0 ? (
+            <p className="text-zinc-600 italic">Starting…</p>
+          ) : (
+            logs.map((line, idx) => (
+              <p
+                key={idx}
+                className={`font-mono text-[11px] leading-relaxed ${line.startsWith("[ERROR]")
+                  ? "text-red-400"
+                  : line.startsWith("[WARN]")
+                    ? "text-amber-400"
+                    : line.startsWith("[Result]")
+                      ? "text-emerald-400"
+                      : "text-zinc-400"
+                  }`}
+              >
+                {line}
+              </p>
+            ))
+          )}
+          <div ref={logsEndRef} />
+        </div>
+
+        <div className="mt-4 rounded-xl border border-white/[0.08] bg-black/30 px-4 py-3">
           <p className="font-mono text-[11px] leading-relaxed break-all text-zinc-400">
             <span className="text-zinc-500">github </span>
             {githubUrl.trim() || "—"}
           </p>
-          <p className="mt-2 font-mono text-[11px] leading-relaxed break-all text-zinc-400">
+          <p className="mt-1 font-mono text-[11px] leading-relaxed break-all text-zinc-400">
             <span className="text-zinc-500">hosted </span>
             {hostedUrl.trim() || "(none)"}
           </p>
@@ -294,6 +420,7 @@ export function AuthWizard() {
         <ProcessingLoader
           githubUrl={githubUrl}
           hostedUrl={hostedUrl}
+          selfScore={Number(score.trim()) || 1}
           onComplete={() => router.push("/")}
         />
       ) : step === 4 ? (
@@ -367,10 +494,10 @@ export function AuthWizard() {
                       <div className="flex shrink-0 flex-col items-center gap-2 px-2">
                         <span
                           className={`flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold transition-all duration-300 ${step === item.n
-                              ? "bg-amber-400 text-zinc-950 ring-2 ring-amber-200/50 shadow-[0_0_20px_rgba(251,191,36,0.35)]"
-                              : step > item.n
-                                ? "border border-amber-500/40 bg-amber-600/25 text-amber-100"
-                                : "border border-white/10 bg-black/30 text-white/40"
+                            ? "bg-amber-400 text-zinc-950 ring-2 ring-amber-200/50 shadow-[0_0_20px_rgba(251,191,36,0.35)]"
+                            : step > item.n
+                              ? "border border-amber-500/40 bg-amber-600/25 text-amber-100"
+                              : "border border-white/10 bg-black/30 text-white/40"
                             }`}
                         >
                           {step > item.n ? (
@@ -381,10 +508,10 @@ export function AuthWizard() {
                         </span>
                         <span
                           className={`text-[0.65rem] font-medium uppercase tracking-wide transition-colors duration-300 sm:text-[11px] ${step === item.n
-                              ? "text-amber-200/90"
-                              : step > item.n
-                                ? "text-amber-100/55"
-                                : "text-white/30"
+                            ? "text-amber-200/90"
+                            : step > item.n
+                              ? "text-amber-100/55"
+                              : "text-white/30"
                             }`}
                         >
                           {item.label}
