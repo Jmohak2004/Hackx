@@ -1,4 +1,4 @@
-# Devs Got Talent
+# Devs Got LAtent
 
 **AI-powered, on-chain hackathon evaluation with stakes, verifiable scores, and wallet-native flows.**
 
