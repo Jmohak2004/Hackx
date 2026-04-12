@@ -16,7 +16,7 @@ export function StageHero() {
 
   const handleTap = useCallback(() => {
     const audio = new Audio(MUSIC_SRC);
-    audio.loop = true;
+    audio.loop = false;
     audio.volume = 1;
     audioRef.current = audio;
     audio.play().catch(() => { });
