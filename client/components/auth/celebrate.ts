@@ -121,3 +121,8 @@ export function runWelcomeConfetti() {
     });
   }, 1100);
 }
+
+/** Results page: self-score matches AI / judge — same burst as welcome. */
+export function runJudgeMatchConfetti() {
+  runWelcomeConfetti();
+}
