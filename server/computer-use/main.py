@@ -9,12 +9,14 @@ Unified scoring modes (0-10 scale, deterministic formulas):
 
 import asyncio
 import logging
+import os
 import re
 from ipaddress import ip_address
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +35,26 @@ app = FastAPI(
     title="Computer-Use AI Judge",
     description="Deterministic hackathon scoring: live websites, GitHub repos, or both (0-10 scale)",
     version="0.3.0",
+)
+
+default_cors_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+]
+extra_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(set(default_cors_origins + extra_cors_origins)),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 LIVE_WEIGHT = 0.5
@@ -56,6 +78,14 @@ def _validate_live_url(v: str) -> str:
             raise
     if parsed.hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
         raise ValueError("URL must not point to localhost")
+    return v
+
+
+def _validate_github_url(v: str) -> str:
+    v = v.strip().rstrip("/")
+    pattern = re.compile(r"^https?://github\.com/[\w.\-]+/[\w.\-]+/?$")
+    if not pattern.match(v):
+        raise ValueError("Invalid GitHub URL. Expected: https://github.com/owner/repo")
     return v
 
 
@@ -84,11 +114,28 @@ class EvaluateRequest(BaseModel):
     def validate_github_url(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        v = v.strip().rstrip("/")
-        pattern = re.compile(r"^https?://github\.com/[\w.\-]+/[\w.\-]+/?$")
-        if not pattern.match(v):
-            raise ValueError("Invalid GitHub URL. Expected: https://github.com/owner/repo")
-        return v
+        return _validate_github_url(v)
+
+
+class ScoreRequest(BaseModel):
+    github_url: str = Field(..., description="GitHub repository URL")
+    hosted_url: str | None = Field(None, description="Optional hosted URL")
+    self_score: float = Field(..., ge=1, le=10, description="User self-score (1-10)")
+
+    @field_validator("github_url")
+    @classmethod
+    def validate_score_github_url(cls, v: str) -> str:
+        return _validate_github_url(v)
+
+    @field_validator("hosted_url")
+    @classmethod
+    def validate_hosted_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        return _validate_live_url(v)
 
 
 class DimensionScoreResponse(BaseModel):
@@ -110,6 +157,29 @@ class EvaluateResponse(BaseModel):
     self_reported_score: float
     delta: float
     honest: bool
+    errors: list[str] = Field(default_factory=list)
+
+
+class LegacyDimensionScoreResponse(BaseModel):
+    score: float
+    reasoning: str
+
+
+class ScoreResponse(BaseModel):
+    github_url: str
+    hosted_url: str
+    page_title: str = ""
+    user_score: float
+    ai_score: float
+    github_score: float
+    avg_score: float
+    breakdown: dict[str, LegacyDimensionScoreResponse] = Field(default_factory=dict)
+    summary: str = ""
+    lighthouse: dict[str, float] = Field(default_factory=dict)
+    delta: float
+    honest: bool
+    user_wins: bool
+    logs: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -209,6 +279,48 @@ async def _score_github(github_url: str, errors: list[str]):
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────
+
+@app.post("/score", response_model=ScoreResponse)
+async def score(req: ScoreRequest):
+    logs = [
+        f"[Pipeline] Starting evaluation for GitHub={req.github_url} hosted={req.hosted_url or '(none)'}",
+        "[Pipeline] Delegating to deterministic evaluator",
+    ]
+
+    result = await evaluate(
+        EvaluateRequest(
+            live_url=req.hosted_url,
+            github_url=req.github_url,
+            self_reported_score=req.self_score,
+        )
+    )
+
+    github_score = round(result.code_score or 0.0, 1)
+    avg_score = round((req.self_score + result.ai_score + github_score) / 3, 2)
+    user_wins = req.self_score >= result.ai_score
+
+    logs.append(
+        f"[Result] user_score={req.self_score}/10 ai_score={result.ai_score}/10 github_score={github_score}/10"
+    )
+    logs.append(f"[Result] avg_score={avg_score}/10 user_wins={user_wins}")
+
+    return ScoreResponse(
+        github_url=req.github_url,
+        hosted_url=req.hosted_url or "",
+        page_title=result.page_title or "",
+        user_score=req.self_score,
+        ai_score=result.ai_score,
+        github_score=github_score,
+        avg_score=avg_score,
+        breakdown={},
+        summary=f"Deterministic {result.mode} scoring completed.",
+        lighthouse=result.lighthouse or {},
+        delta=result.delta,
+        honest=result.honest,
+        user_wins=user_wins,
+        logs=logs,
+        errors=result.errors,
+    )
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(req: EvaluateRequest):
