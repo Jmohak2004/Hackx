@@ -423,10 +423,10 @@ function ProcessingLoader({
         Home
       </Link>
 
-      <div className="relative flex min-h-[42vh] w-full shrink-0 border-b border-white/10 md:min-h-0 md:w-1/2 md:border-b-0 md:border-r">
+      <div className="relative flex h-[48vh] w-full shrink-0 items-center justify-center bg-black border-b border-white/10 md:h-dvh md:w-1/2 md:border-b-0 md:border-r md:px-4 md:py-6 lg:px-8">
         <video
           key={clipIndex}
-          className="h-full w-full object-cover"
+          className="box-border h-full w-full object-contain object-center"
           src={LOADER_CLIPS[clipIndex]}
           autoPlay
           playsInline
@@ -435,7 +435,7 @@ function ProcessingLoader({
           onError={handleError}
         />
         <div
-          className="pointer-events-none absolute inset-0 bg-linear-to-t from-black/70 via-transparent to-black/30"
+          className="pointer-events-none absolute inset-0 bg-linear-to-t from-black/45 via-transparent to-black/20"
           aria-hidden
         />
         <p className="absolute bottom-4 left-4 right-4 text-center text-xs font-medium uppercase tracking-[0.2em] text-white/70 md:text-left">

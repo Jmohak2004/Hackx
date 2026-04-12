@@ -1,7 +1,10 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useCallback, useState } from "react";
+
+const START_SVG = "/images/START.svg";
 
 /** Place your file at `public/images/stage.mp4` */
 const STAGE_VIDEO_SRC = "/images/stage.mp4";
@@ -43,33 +46,18 @@ export function StageHero() {
           <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center p-6">
             <Link
               href="/auth"
-              className="group pointer-events-auto relative inline-flex rounded-2xl border-b-8 border-amber-800 bg-amber-400 px-8 py-4 font-bold tracking-wider text-amber-950 uppercase shadow-[0_15px_25px_-10px_rgba(217,119,6,0.75)] transition-all duration-100 hover:text-amber-950 focus:outline-none focus:ring-4 focus:ring-amber-300/60 active:translate-y-2 active:border-b-0 no-underline"
+              className="pointer-events-auto block rounded-lg no-underline transition-transform duration-150 hover:scale-[1.04] active:scale-[0.98] focus:outline-none focus-visible:ring-4 focus-visible:ring-amber-300/60 focus-visible:ring-offset-2 focus-visible:ring-offset-black/50"
+              aria-label="Start — open registration"
             >
-              <span
-                className="pointer-events-none absolute inset-0 h-full w-full rounded-2xl bg-linear-to-t from-black/20 to-transparent"
-                aria-hidden
+              <Image
+                src={START_SVG}
+                alt=""
+                width={280}
+                height={280}
+                unoptimized
+                className="h-auto w-[min(18rem,82vw)] max-w-[360px] drop-shadow-[0_12px_40px_rgba(0,0,0,0.55)] sm:w-80 sm:max-w-[420px] md:w-96 md:max-w-none"
+                priority
               />
-              <span
-                className="pointer-events-none absolute left-3 top-2 h-3 w-6 rounded-full bg-white/40 blur-[2px]"
-                aria-hidden
-              />
-              <span className="relative flex items-center justify-center gap-2 drop-shadow-md">
-                <svg
-                  className="h-6 w-6 animate-pulse"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                  viewBox="0 0 24 24"
-                  aria-hidden
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M13 10V3L4 14h7v7l9-11h-7z"
-                  />
-                </svg>
-                Start
-              </span>
             </Link>
           </div>
         </>
