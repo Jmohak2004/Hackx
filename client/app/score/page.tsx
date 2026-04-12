@@ -2,7 +2,17 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
+import {
+  createPublicClient,
+  createWalletClient,
+  custom,
+  fallback,
+  http,
+  type Address,
+} from "viem";
+import { sepolia } from "viem/chains";
+import { GAME_ABI, GAME_CONTRACT_ADDRESS } from "@/lib/contract";
 
 interface DimensionScore {
   score: number;
@@ -30,6 +40,94 @@ interface ScoreData {
   user_wins: boolean;
   logs: string[];
   errors: string[];
+  chain?: {
+    entryId: string | null;
+    roundId: string | null;
+    scoreTxHash: string | null;
+    isWinnerOnChain: boolean | null;
+    claimTxHash: string | null;
+  };
+}
+
+const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
+const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL;
+
+const viemPublicClient = createPublicClient({
+  chain: sepolia,
+  transport: rpcUrl
+    ? http(rpcUrl)
+    : fallback([
+        http("https://ethereum-sepolia-rpc.publicnode.com"),
+        http("https://sepolia.drpc.org"),
+      ]),
+});
+
+async function ensureWalletOnSepolia() {
+  if (typeof window === "undefined" || !window.ethereum) {
+    throw new Error("No wallet detected. Please install MetaMask.");
+  }
+
+  const currentChainId = (await window.ethereum.request({
+    method: "eth_chainId",
+  })) as string;
+
+  if (currentChainId?.toLowerCase() === SEPOLIA_CHAIN_ID_HEX) return;
+
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_CHAIN_ID_HEX }],
+    });
+  } catch (err: unknown) {
+    if ((err as { code?: number }).code === 4902) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: SEPOLIA_CHAIN_ID_HEX,
+            chainName: "Sepolia Testnet",
+            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+            rpcUrls: [rpcUrl || "https://ethereum-sepolia-rpc.publicnode.com"],
+            blockExplorerUrls: ["https://sepolia.etherscan.io"],
+          },
+        ],
+      });
+      return;
+    }
+
+    throw err;
+  }
+}
+
+async function claimPrizeOnChain(entryId: bigint): Promise<string> {
+  await ensureWalletOnSepolia();
+
+  const accounts = (await window.ethereum!.request({
+    method: "eth_requestAccounts",
+  })) as string[];
+
+  if (!accounts?.length) {
+    throw new Error("No wallet account connected.");
+  }
+
+  const walletAddress = accounts[0] as Address;
+
+  const walletClient = createWalletClient({
+    account: walletAddress,
+    chain: sepolia,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    transport: custom(window.ethereum as any),
+  });
+
+  const hash = await walletClient.writeContract({
+    address: GAME_CONTRACT_ADDRESS,
+    abi: GAME_ABI,
+    functionName: "claimPrize",
+    args: [entryId],
+  });
+
+  await viemPublicClient.waitForTransactionReceipt({ hash });
+  return hash;
 }
 
 const SCORE_LABELS: Record<string, string> = {
@@ -89,6 +187,9 @@ function ScoreCard({
 function ResultsContent() {
   const params = useSearchParams();
   const raw = params.get("d");
+  const [claimStatus, setClaimStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
+  const [claimError, setClaimError] = useState<string | null>(null);
+  const [claimTxHash, setClaimTxHash] = useState<string | null>(null);
 
   if (!raw) {
     return (
@@ -118,6 +219,32 @@ function ResultsContent() {
   const breakdownEntries = Object.entries(data.breakdown ?? {}).filter(
     ([, v]) => v != null
   ) as [string, DimensionScore][];
+
+  const roundedAverageScore = Math.round(data.avg_score);
+  const isScoreTie = data.user_score === roundedAverageScore;
+  const chainEntryId = data.chain?.entryId ?? null;
+  const effectiveClaimTxHash = claimTxHash ?? data.chain?.claimTxHash ?? null;
+  const canClaimPrize = isScoreTie && !!chainEntryId && !effectiveClaimTxHash;
+
+  const handleClaimPrize = async () => {
+    if (!chainEntryId) {
+      setClaimStatus("error");
+      setClaimError("Entry ID is missing. Please submit again and retry claim.");
+      return;
+    }
+
+    try {
+      setClaimStatus("pending");
+      setClaimError(null);
+      const tx = await claimPrizeOnChain(BigInt(chainEntryId));
+      setClaimTxHash(tx);
+      setClaimStatus("success");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setClaimError(message);
+      setClaimStatus("error");
+    }
+  };
 
   return (
     <div className="relative min-h-dvh w-full overflow-x-hidden bg-zinc-950 text-amber-50">
@@ -172,9 +299,50 @@ function ResultsContent() {
         {/* Two score cards */}
         <div className="mt-8 grid grid-cols-2 gap-4">
           <ScoreCard label="Your Score" value={data.user_score} max={10} color="amber" />
-          <ScoreCard label="Average Score" value={Math.round(data.avg_score)} max={10} color="emerald" />
+          <ScoreCard label="Average Score" value={roundedAverageScore} max={10} color="emerald" />
         </div>
         <p className="mt-2 text-center text-xs text-zinc-600">Win condition: your score = average score</p>
+
+        {isScoreTie && (
+          <div className="mt-6 rounded-2xl border border-emerald-400/30 bg-emerald-500/10 px-6 py-5">
+            <p className="text-sm font-semibold text-emerald-300">
+              Tie detected: your score matches the average score.
+            </p>
+
+            {effectiveClaimTxHash ? (
+              <p className="mt-2 text-xs text-emerald-200">
+                Prize claim submitted:{" "}
+                <a
+                  href={`https://sepolia.etherscan.io/tx/${effectiveClaimTxHash}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline decoration-emerald-300/70 underline-offset-2 hover:text-emerald-100"
+                >
+                  {effectiveClaimTxHash}
+                </a>
+              </p>
+            ) : chainEntryId ? (
+              <div className="mt-3">
+                <button
+                  type="button"
+                  onClick={handleClaimPrize}
+                  disabled={!canClaimPrize || claimStatus === "pending"}
+                  className="rounded-xl bg-linear-to-b from-emerald-300 to-emerald-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-emerald-950/35 transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {claimStatus === "pending" ? "Claiming..." : "Claim Pool Prize"}
+                </button>
+              </div>
+            ) : (
+              <p className="mt-2 text-xs text-zinc-300">
+                Entry ID not found for this run, so claim is unavailable.
+              </p>
+            )}
+
+            {claimError && (
+              <p className="mt-2 text-xs text-red-300">Claim failed: {claimError}</p>
+            )}
+          </div>
+        )}
 
         {/* AI Summary */}
         {data.summary && (
