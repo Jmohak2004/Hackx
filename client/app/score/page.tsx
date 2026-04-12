@@ -50,6 +50,8 @@ interface ScoreData {
 }
 
 const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
+const MAX_SAFE_CLAIM_GAS = 1_000_000n;
+const FALLBACK_CLAIM_GAS = 500_000n;
 const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL;
 
 const viemPublicClient = createPublicClient({
@@ -119,11 +121,30 @@ async function claimPrizeOnChain(entryId: bigint): Promise<string> {
     transport: custom(window.ethereum as any),
   });
 
+  let gasLimit = FALLBACK_CLAIM_GAS;
+  try {
+    const estimatedGas = await viemPublicClient.estimateContractGas({
+      address: GAME_CONTRACT_ADDRESS,
+      abi: GAME_ABI,
+      functionName: "claimPrize",
+      args: [entryId],
+      account: walletAddress,
+    });
+
+    // Add modest headroom while keeping below problematic provider caps.
+    const withHeadroom = estimatedGas + estimatedGas / 5n;
+    gasLimit = withHeadroom > MAX_SAFE_CLAIM_GAS ? MAX_SAFE_CLAIM_GAS : withHeadroom;
+  } catch {
+    // Keep fallback gas to avoid 21M wallet defaults on some providers.
+    gasLimit = FALLBACK_CLAIM_GAS;
+  }
+
   const hash = await walletClient.writeContract({
     address: GAME_CONTRACT_ADDRESS,
     abi: GAME_ABI,
     functionName: "claimPrize",
     args: [entryId],
+    gas: gasLimit,
   });
 
   await viemPublicClient.waitForTransactionReceipt({ hash });
