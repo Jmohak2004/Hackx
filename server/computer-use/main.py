@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from ipaddress import ip_address
 from urllib.parse import urlparse
 
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 from agents.browser_agent import capture_screenshots
 from agents.code_agent import analyze_repo
 from agents.lighthouse_agent import run_lighthouse
+from agents.roast_agent import generate_roast
 from scoring.code_scorer import score_codebase
 from scoring.rubric import HONESTY_THRESHOLD
 from scoring.vision_scorer import score_website
@@ -157,6 +159,8 @@ class EvaluateResponse(BaseModel):
     self_reported_score: float
     delta: float
     honest: bool
+    roasts: list[str] = Field(default_factory=list)
+    vibe: str = ""
     errors: list[str] = Field(default_factory=list)
 
 
@@ -187,12 +191,14 @@ class ScoreResponse(BaseModel):
 
 async def _score_live_url(url: str, errors: list[str]):
     logger.info("Starting live URL pipeline for %s", url)
+    t0 = time.time()
 
     browser_result, lighthouse_result = await asyncio.gather(
         capture_screenshots(url),
         run_lighthouse(url),
         return_exceptions=True,
     )
+    logger.info("⏱ Browser + Lighthouse (parallel): %.1fs", time.time() - t0)
 
     if isinstance(browser_result, Exception):
         errors.append(f"Browser agent crashed: {browser_result}")
@@ -234,6 +240,9 @@ async def _score_live_url(url: str, errors: list[str]):
         "breakdown": breakdown,
         "lighthouse": lighthouse_scores,
         "page_title": browser_result.page_title,
+        "meta_description": browser_result.meta_description,
+        "headings": browser_result.headings,
+        "hero_text": browser_result.hero_text,
     }
 
 
@@ -324,6 +333,7 @@ async def score(req: ScoreRequest):
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate(req: EvaluateRequest):
+    t_start = time.time()
     errors: list[str] = []
 
     has_live = bool(req.live_url)
@@ -332,6 +342,7 @@ async def evaluate(req: EvaluateRequest):
     live_result = None
     code_result = None
 
+    t_pipeline = time.time()
     if has_live and has_github:
         live_result, code_result = await asyncio.gather(
             _score_live_url(req.live_url, errors),
@@ -341,6 +352,7 @@ async def evaluate(req: EvaluateRequest):
         live_result = await _score_live_url(req.live_url, errors)
     else:
         code_result = await _score_github(req.github_url, errors)
+    logger.info("⏱ Scoring pipeline: %.1fs", time.time() - t_pipeline)
 
     if has_live and has_github:
         mode = "combined"
@@ -366,6 +378,28 @@ async def evaluate(req: EvaluateRequest):
         ai_score = code_result["score"]
 
     delta = round(abs(ai_score - req.self_reported_score), 1)
+    honest = delta <= HONESTY_THRESHOLD
+
+    # Generate funny commentary (non-blocking, best-effort)
+    t_roast = time.time()
+    roast_result = await generate_roast(
+        mode=mode,
+        ai_score=ai_score,
+        self_reported_score=req.self_reported_score,
+        honest=honest,
+        page_title=live_result["page_title"] if live_result else None,
+        meta_description=live_result.get("meta_description") if live_result else None,
+        headings=live_result.get("headings") if live_result else None,
+        hero_text=live_result.get("hero_text") if live_result else None,
+        live_url=req.live_url,
+        lighthouse=live_result["lighthouse"] if live_result else None,
+        live_breakdown={k: {"score": v.score, "max_score": v.max_score} for k, v in live_result["breakdown"].items()} if live_result else None,
+        code_breakdown={k: {"score": v.score, "max_score": v.max_score} for k, v in code_result["breakdown"].items()} if code_result else None,
+        live_score=live_result["score"] if live_result else None,
+        code_score=code_result["score"] if code_result else None,
+    )
+    logger.info("⏱ Roast generation: %.1fs", time.time() - t_roast)
+    logger.info("⏱ Total request: %.1fs", time.time() - t_start)
 
     return EvaluateResponse(
         mode=mode,
@@ -380,7 +414,9 @@ async def evaluate(req: EvaluateRequest):
         lighthouse=live_result["lighthouse"] if live_result else None,
         self_reported_score=req.self_reported_score,
         delta=delta,
-        honest=delta <= HONESTY_THRESHOLD,
+        honest=honest,
+        roasts=roast_result.roasts,
+        vibe=roast_result.vibe,
         errors=errors,
     )
 
