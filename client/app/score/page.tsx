@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Suspense } from "react";
+import { Suspense, useEffect, useRef } from "react";
+import { runJudgeMatchConfetti } from "@/components/auth/celebrate";
+import { ResultBackdrop } from "@/components/score/ResultBackdrop";
 
 interface DimensionScore {
   score: number;
@@ -30,6 +32,7 @@ interface ScoreData {
   user_wins: boolean;
   logs: string[];
   errors: string[];
+  chain?: Record<string, unknown>;
 }
 
 const SCORE_LABELS: Record<string, string> = {
@@ -47,41 +50,6 @@ function ScoreBar({ value, max }: { value: number; max: number }) {
         className="h-full rounded-full bg-gradient-to-r from-amber-500 to-amber-300 transition-all duration-700"
         style={{ width: `${pct}%` }}
       />
-    </div>
-  );
-}
-
-function ScoreCard({
-  label,
-  value,
-  max,
-  color,
-}: {
-  label: string;
-  value: number;
-  max: number;
-  color: "amber" | "emerald" | "cyan";
-}) {
-  const ring =
-    color === "amber"
-      ? "border-amber-400/40 shadow-amber-900/30"
-      : color === "emerald"
-      ? "border-emerald-400/40 shadow-emerald-900/30"
-      : "border-cyan-400/40 shadow-cyan-900/30";
-  const text =
-    color === "amber"
-      ? "text-amber-300"
-      : color === "emerald"
-      ? "text-emerald-300"
-      : "text-cyan-300";
-
-  return (
-    <div
-      className={`flex flex-col items-center rounded-2xl border ${ring} bg-zinc-950/70 px-6 py-6 shadow-lg backdrop-blur-md`}
-    >
-      <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500">{label}</p>
-      <p className={`mt-3 text-5xl font-bold tabular-nums ${text}`}>{value}</p>
-      <p className="mt-1 text-xs text-zinc-600">/ {max}</p>
     </div>
   );
 }
@@ -119,67 +87,58 @@ function ResultsContent() {
     ([, v]) => v != null
   ) as [string, DimensionScore][];
 
+  const scoresMatch =
+    Math.round(Number(data.user_score)) === Math.round(Number(data.ai_score));
+  const resultVariant = scoresMatch ? "match" : "mismatch";
+
+  const confettiOnce = useRef(false);
+  useEffect(() => {
+    if (!scoresMatch || confettiOnce.current) return;
+    confettiOnce.current = true;
+    runJudgeMatchConfetti();
+  }, [scoresMatch]);
+
   return (
-    <div className="relative min-h-dvh w-full overflow-x-hidden bg-zinc-950 text-amber-50">
-      {/* Background glow */}
+    <div className="relative min-h-dvh w-full overflow-x-hidden bg-black text-amber-50">
       <div
         className="pointer-events-none fixed inset-0 z-0"
         aria-hidden
         style={{
           background:
-            "radial-gradient(ellipse 80% 60% at 50% 0%, rgba(180,83,9,0.18) 0%, transparent 70%)",
+            "radial-gradient(ellipse 80% 50% at 50% 15%, rgba(180,83,9,0.2) 0%, transparent 55%)",
         }}
       />
 
-      <div className="relative z-10 mx-auto max-w-3xl px-5 pb-24 pt-12 sm:px-8">
-        {/* Header */}
-        <div className="mb-2 flex items-center justify-between">
+      <div className="relative z-10 flex min-h-dvh flex-col px-4 pb-16 pt-6 sm:px-6 sm:pt-8">
+        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4">
           <Link
             href="/"
-            className="rounded-full border border-white/15 bg-black/30 px-3 py-1.5 text-sm text-amber-100/90 backdrop-blur-md transition-colors hover:border-amber-300/30"
+            className="shrink-0 rounded-full border border-white/15 bg-black/40 px-3 py-1.5 text-sm text-amber-100/90 backdrop-blur-md transition-colors hover:border-amber-300/30"
           >
             ← Home
           </Link>
           <p className="text-[0.65rem] font-semibold uppercase tracking-[0.28em] text-amber-200/60">
             Results
           </p>
-          <span className="w-16" />
+          <span className="w-[4.5rem] shrink-0 sm:w-20" aria-hidden />
         </div>
 
-        {/* Winner banner */}
-        <div
-          className={`mt-8 rounded-2xl border px-6 py-5 text-center ${
-            data.user_wins
-              ? "border-emerald-400/30 bg-emerald-500/10"
-              : "border-red-400/25 bg-red-500/8"
-          }`}
-        >
-          <p
-            className={`text-3xl font-bold ${
-              data.user_wins ? "text-emerald-300" : "text-red-300"
-            }`}
-          >
-            {data.user_wins ? "🏆 You Win!" : "🤖 AI Wins"}
+        <div className="mx-auto mt-6 flex w-full max-w-6xl flex-1 flex-col items-center justify-center">
+          <ResultBackdrop
+            variant={resultVariant}
+            yourScore={data.user_score}
+            judgeScore={data.ai_score}
+          />
+          <p className="mt-6 max-w-xl text-center text-sm text-zinc-400">
+            {scoresMatch
+              ? "Your score matches the judge — nice read on your own work."
+              : "Your score and the judge’s score differ — use the breakdown below to see why."}
           </p>
-          <p className="mt-2 text-sm text-zinc-400">
-            {data.user_wins
-              ? "Your self-score matched or beat the AI's assessment."
-              : "The AI scored your project differently — keep building!"}
-          </p>
-          {data.page_title && (
-            <p className="mt-3 text-xs text-zinc-600 font-mono">{data.page_title}</p>
-          )}
         </div>
 
-        {/* Three score cards */}
-        <div className="mt-8 grid grid-cols-3 gap-4">
-          <ScoreCard label="Your Score" value={data.user_score} max={10} color="amber" />
-          <ScoreCard label="AI Score" value={data.ai_score} max={10} color="cyan" />
-          <ScoreCard label="GitHub Score" value={data.github_score} max={10} color="emerald" />
-        </div>
-
-        {/* Avg score */}
-        <div className="mt-4 rounded-2xl border border-white/10 bg-zinc-900/60 px-6 py-4 text-center">
+        {/* Avg + detail */}
+        <div className="relative z-10 mx-auto mt-10 w-full max-w-3xl px-1 sm:px-0">
+          <div className="rounded-2xl border border-white/10 bg-zinc-900/60 px-6 py-4 text-center">
           <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500">
             Average Score
           </p>
@@ -187,7 +146,7 @@ function ResultsContent() {
             {data.avg_score.toFixed(2)}
             <span className="ml-1 text-xl font-normal text-zinc-500">/ 10</span>
           </p>
-        </div>
+          </div>
 
         {/* AI Summary */}
         {data.summary && (
@@ -321,6 +280,7 @@ function ResultsContent() {
           >
             Back to stage
           </Link>
+        </div>
         </div>
       </div>
     </div>

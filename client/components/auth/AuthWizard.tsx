@@ -415,7 +415,7 @@ function ProcessingLoader({
   }, []);
 
   return (
-    <div className="relative z-20 flex min-h-dvh w-full flex-col bg-zinc-950/90 md:flex-row">
+    <div className="relative z-20 flex min-h-dvh w-full flex-col bg-black md:min-h-0 md:h-dvh md:flex-row">
       <Link
         href="/"
         className="absolute right-4 top-4 z-30 rounded-full border border-white/15 bg-black/40 px-3 py-1.5 text-sm text-amber-100/90 backdrop-blur-md transition-colors hover:border-amber-300/35 hover:bg-black/55 sm:right-5 sm:top-5 sm:px-4 sm:py-2"
@@ -423,10 +423,10 @@ function ProcessingLoader({
         Home
       </Link>
 
-      <div className="relative flex h-[48vh] w-full shrink-0 items-center justify-center bg-black border-b border-white/10 md:h-dvh md:w-1/2 md:border-b-0 md:border-r md:px-4 md:py-6 lg:px-8">
+      <div className="relative h-[min(78dvh,100dvh)] w-full shrink-0 overflow-hidden border-b border-white/10 bg-black md:h-full md:min-h-0 md:flex-[1.35] md:border-b-0 md:border-r md:border-white/10">
         <video
           key={clipIndex}
-          className="box-border h-full w-full object-contain object-center"
+          className="absolute inset-0 h-full w-full object-cover object-center"
           src={LOADER_CLIPS[clipIndex]}
           autoPlay
           playsInline
@@ -435,15 +435,12 @@ function ProcessingLoader({
           onError={handleError}
         />
         <div
-          className="pointer-events-none absolute inset-0 bg-linear-to-t from-black/45 via-transparent to-black/20"
+          className="pointer-events-none absolute inset-0 bg-linear-to-t from-black/30 via-transparent to-black/15"
           aria-hidden
         />
-        <p className="absolute bottom-4 left-4 right-4 text-center text-xs font-medium uppercase tracking-[0.2em] text-white/70 md:text-left">
-          Clip {clipIndex + 1} / {LOADER_CLIPS.length}
-        </p>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col justify-center px-6 py-10 sm:px-10 md:py-16 md:pl-12 md:pr-10">
+      <div className="flex min-h-0 flex-1 flex-col justify-center overflow-y-auto px-4 py-8 sm:px-8 md:min-h-0 md:flex-1 md:py-10 md:pl-10 md:pr-8 lg:pl-12 bg-zinc-950/95 md:bg-zinc-950/90">
         <p className="text-[0.65rem] font-semibold uppercase tracking-[0.28em] text-amber-200/75">
           Processing
         </p>
