@@ -6,7 +6,7 @@ import { sepolia } from "viem/chains";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const GAME_CONTRACT_ADDRESS: Address =
-  "0x13a8638041b2825937756e19b775536c0150f429";
+  "0xcf5f572a03a9054d623fa28d66e51af50ccd2f77";
 
 export const SUPPORTED_CHAIN = sepolia;
 
@@ -207,6 +207,16 @@ export const GAME_ABI = [
   },
   {
     type: "function",
+    name: "getMyEntries",
+    inputs: [
+      { name: "roundId", type: "uint256" },
+      { name: "participant", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256[]" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
     name: "getPrizePool",
     inputs: [{ name: "roundId", type: "uint256" }],
     outputs: [
@@ -384,7 +394,6 @@ export const GAME_ABI = [
       { name: "sent", type: "uint256" },
     ],
   },
-  { type: "error", name: "AlreadyEntered", inputs: [] },
   { type: "error", name: "NotScored", inputs: [] },
   { type: "error", name: "AlreadyClaimed", inputs: [] },
   { type: "error", name: "NotWinner", inputs: [] },

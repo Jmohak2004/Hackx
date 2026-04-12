@@ -1,12 +1,17 @@
 """
 Vision scorer — sends screenshots + Lighthouse data to Gemma 4 31B
 via the NVIDIA API and parses the structured scoring response.
+
+Scores are cached on disk keyed by SHA-256(url) so the same URL
+always returns identical results across runs.
 """
 
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 
@@ -14,6 +19,31 @@ from scoring.rubric import SYSTEM_PROMPT, build_user_message
 
 NVIDIA_INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL = "google/gemma-4-31b-it"
+
+_CACHE_DIR = Path(__file__).parent.parent / "score-cache"
+_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _cache_key(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _load_cache(url: str) -> dict | None:
+    path = _CACHE_DIR / f"{_cache_key(url)}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return None
+
+
+def _save_cache(url: str, data: dict) -> None:
+    path = _CACHE_DIR / f"{_cache_key(url)}.json"
+    try:
+        path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
 
 
 @dataclass
@@ -37,12 +67,42 @@ class VisionScorerResult:
 def score_website(
     screenshots_b64: list[dict],  # [{"viewport": str, "b64_image": str}, ...]
     lighthouse_scores: dict,
+    url: str = "",
 ) -> VisionScorerResult:
     """
     Call Gemma 4 31B via NVIDIA API with screenshots and Lighthouse data.
-    Returns structured scores.
+    Results are cached by URL so the same site always scores identically.
     """
     result = VisionScorerResult()
+
+    # ── Cache hit: return stored result immediately ───────────────────────
+    if url:
+        cached = _load_cache(url)
+        if cached:
+            result.raw_response = "[from cache]"
+            def _ci(v, lo, hi): return max(lo, min(hi, int(round(float(v)))))
+            result.visual_design = DimensionScore(
+                score=_ci(cached["visual_design"]["score"], 0, 30),
+                reasoning=cached["visual_design"]["reasoning"],
+            )
+            result.responsiveness = DimensionScore(
+                score=_ci(cached["responsiveness"]["score"], 0, 25),
+                reasoning=cached["responsiveness"]["reasoning"],
+            )
+            result.ux_interactivity = DimensionScore(
+                score=_ci(cached["ux_interactivity"]["score"], 0, 25),
+                reasoning=cached["ux_interactivity"]["reasoning"],
+            )
+            result.performance_accessibility = DimensionScore(
+                score=_ci(cached["performance_accessibility"]["score"], 0, 20),
+                reasoning=cached["performance_accessibility"]["reasoning"],
+            )
+            result.summary = cached.get("summary", "")
+            result.total_score = (
+                result.visual_design.score + result.responsiveness.score
+                + result.ux_interactivity.score + result.performance_accessibility.score
+            )
+            return result
 
     api_key = os.environ.get("NVIDIA_API_KEY")
     if not api_key:
@@ -83,9 +143,10 @@ def score_website(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": 4096,
-        "temperature": 0.3,  # Low temp for consistent scoring
-        "top_p": 0.9,
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 42,
         "stream": False,
     }
 
@@ -108,34 +169,45 @@ def score_website(
             result.error = f"Failed to parse JSON from model response"
             return result
 
+        def _clamp_int(val, lo: int, hi: int) -> int:
+            """Convert val to int and clamp to [lo, hi]. Prevents hallucinated floats/OOB."""
+            return max(lo, min(hi, int(round(float(val)))))
+
         result.visual_design = DimensionScore(
-            score=int(parsed["visual_design"]["score"]),
-            reasoning=parsed["visual_design"]["reasoning"],
+            score=_clamp_int(parsed["visual_design"]["score"], 0, 30),
+            reasoning=str(parsed["visual_design"]["reasoning"])[:300],
         )
         result.responsiveness = DimensionScore(
-            score=int(parsed["responsiveness"]["score"]),
-            reasoning=parsed["responsiveness"]["reasoning"],
+            score=_clamp_int(parsed["responsiveness"]["score"], 0, 25),
+            reasoning=str(parsed["responsiveness"]["reasoning"])[:300],
         )
         result.ux_interactivity = DimensionScore(
-            score=int(parsed["ux_interactivity"]["score"]),
-            reasoning=parsed["ux_interactivity"]["reasoning"],
+            score=_clamp_int(parsed["ux_interactivity"]["score"], 0, 25),
+            reasoning=str(parsed["ux_interactivity"]["reasoning"])[:300],
         )
         result.performance_accessibility = DimensionScore(
-            score=int(parsed["performance_accessibility"]["score"]),
-            reasoning=parsed["performance_accessibility"]["reasoning"],
+            score=_clamp_int(parsed["performance_accessibility"]["score"], 0, 20),
+            reasoning=str(parsed["performance_accessibility"]["reasoning"])[:300],
         )
-        result.total_score = int(parsed.get("total_score", 0))
-        result.summary = parsed.get("summary", "")
+        result.summary = str(parsed.get("summary", ""))[:500]
 
-        # Validate total matches sum
-        computed = (
+        # Always recompute total from clamped dimension scores — never trust model's total
+        result.total_score = (
             result.visual_design.score
             + result.responsiveness.score
             + result.ux_interactivity.score
             + result.performance_accessibility.score
         )
-        if result.total_score != computed:
-            result.total_score = computed
+
+        # ── Cache the result for this URL ────────────────────────────────
+        if url:
+            _save_cache(url, {
+                "visual_design": {"score": result.visual_design.score, "reasoning": result.visual_design.reasoning},
+                "responsiveness": {"score": result.responsiveness.score, "reasoning": result.responsiveness.reasoning},
+                "ux_interactivity": {"score": result.ux_interactivity.score, "reasoning": result.ux_interactivity.reasoning},
+                "performance_accessibility": {"score": result.performance_accessibility.score, "reasoning": result.performance_accessibility.reasoning},
+                "summary": result.summary,
+            })
 
     except requests.HTTPError as exc:
         result.error = f"NVIDIA API error: {exc.response.status_code} — {exc.response.text[:500]}"
