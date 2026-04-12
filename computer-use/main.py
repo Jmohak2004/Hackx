@@ -107,7 +107,7 @@ class ScoreResult(BaseModel):
     user_score: int
     ai_score: int
     github_score: int
-    avg_score: float
+    avg_score: int
     breakdown: ScoreBreakdown
     summary: str
     lighthouse: dict[str, float]
@@ -135,14 +135,67 @@ class EvaluateResponse(BaseModel):
 
 def _score_github(github_url: str) -> tuple[int, str]:
     """
-    Heuristic GitHub score (1-10 scale) based on URL structure.
-    Returns (score, log_message).
-    A real implementation would call the GitHub API via server/githubPipeline.
-    For now we give a baseline score of 5 and note it in logs.
+    Score a GitHub repo (1-10) using real API data: stars, forks, open issues,
+    recent commit activity, and whether a README exists.
+    Falls back to 5 if the token is missing or API call fails.
     """
-    score = 5
-    log = f"[GitHub] Assessed repo at {github_url} → baseline score {score}/10 (heuristic)"
-    return score, log
+    import os, re, datetime
+    import requests as _req
+
+    token = os.environ.get("GITHUB_TOKEN", "")
+
+    # Parse owner/repo from URL
+    m = re.search(r"github\.com/([^/]+)/([^/?.#]+)", github_url)
+    if not m:
+        return 5, f"[GitHub] Could not parse owner/repo from {github_url} → score=5"
+
+    owner, repo = m.group(1), m.group(2).rstrip(".git")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = _req.get(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            headers=headers, timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        stars   = data.get("stargazers_count", 0)
+        forks   = data.get("forks_count", 0)
+        issues  = data.get("open_issues_count", 0)
+        has_desc = 1 if data.get("description") else 0
+        pushed_at = data.get("pushed_at", "")
+
+        # Recency: days since last push
+        days_stale = 9999
+        if pushed_at:
+            try:
+                last = datetime.datetime.fromisoformat(pushed_at.replace("Z", "+00:00"))
+                days_stale = (datetime.datetime.now(datetime.timezone.utc) - last).days
+            except Exception:
+                pass
+
+        # Scoring heuristic (1-10)
+        score = 5  # baseline
+        if stars >= 10:   score += 1
+        if stars >= 50:   score += 1
+        if forks >= 5:    score += 1
+        if has_desc:      score += 1
+        if days_stale <= 7:  score += 1
+        elif days_stale > 90: score -= 1
+        if issues > 20:   score -= 1
+        score = max(1, min(10, score))
+
+        log = (
+            f"[GitHub] {owner}/{repo}: stars={stars} forks={forks} issues={issues} "
+            f"days_since_push={days_stale} → score={score}/10"
+        )
+        return score, log
+
+    except Exception as exc:
+        return 5, f"[GitHub] API call failed ({exc}) → fallback score=5"
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────
@@ -221,8 +274,12 @@ async def score(req: ScoreRequest):
     }
 
     logs.append(f"[Step 3] Sending {len(screenshots_b64)} screenshot(s) to Gemma 4 31B vision model via NVIDIA API…")
+    logs.append(f"[Step 3] Checking score cache for {req.hosted_url}…")
 
-    scorer_result = await asyncio.to_thread(score_website, screenshots_b64, lighthouse_scores)
+    scorer_result = await asyncio.to_thread(score_website, screenshots_b64, lighthouse_scores, req.hosted_url)
+
+    if scorer_result.raw_response == "[from cache]":
+        logs.append("[Step 3] Cache HIT — returning stored scores (deterministic, no AI call made)")
 
     if scorer_result.error:
         errors.append(f"Vision scorer: {scorer_result.error}")
@@ -237,17 +294,22 @@ async def score(req: ScoreRequest):
             detail=f"Vision scoring failed: {scorer_result.error}",
         )
 
-    # ── Normalise scores to 1-10 scale ───────────────────────────────────
-    ai_score_raw = scorer_result.total_score  # 0-100
+    # ── Normalise AI score 0-100 → 1-10 (integer) ───────────────────────
+    ai_score_raw = scorer_result.total_score  # guaranteed int 0-100 after clamping
     ai_score = max(1, min(10, round(ai_score_raw / 10)))
-    user_score = req.self_score  # already 1-10
+    user_score = req.self_score  # already int 1-10
 
-    avg_score = round((user_score + ai_score + github_score) / 3, 2)
+    # avg of the three integer scores, rounded to nearest integer
+    avg_score = round((user_score + ai_score + github_score) / 3)
+
+    # User WINS when their self-score exactly matches the average
+    user_wins = user_score == avg_score
+
+    # delta: how far user was from the AI score
     delta = abs(ai_score - user_score)
-    user_wins = user_score >= ai_score
 
     logs.append(f"[Result] user_score={user_score}/10  ai_score={ai_score}/10  github_score={github_score}/10")
-    logs.append(f"[Result] avg_score={avg_score}/10  delta={delta}  user_wins={user_wins}")
+    logs.append(f"[Result] avg_score={avg_score}/10  delta={delta}  user_wins={user_wins} (wins when user_score==avg_score)")
 
     # ── Build breakdown ───────────────────────────────────────────────────
     breakdown = ScoreBreakdown()

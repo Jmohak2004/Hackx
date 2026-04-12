@@ -16,7 +16,7 @@ interface ScoreData {
   user_score: number;
   ai_score: number;
   github_score: number;
-  avg_score: number;
+  avg_score: number;  // integer — rounded average of user+ai+github scores
   breakdown: {
     visual_design?: DimensionScore;
     responsiveness?: DimensionScore;
@@ -66,14 +66,14 @@ function ScoreCard({
     color === "amber"
       ? "border-amber-400/40 shadow-amber-900/30"
       : color === "emerald"
-      ? "border-emerald-400/40 shadow-emerald-900/30"
-      : "border-cyan-400/40 shadow-cyan-900/30";
+        ? "border-emerald-400/40 shadow-emerald-900/30"
+        : "border-cyan-400/40 shadow-cyan-900/30";
   const text =
     color === "amber"
       ? "text-amber-300"
       : color === "emerald"
-      ? "text-emerald-300"
-      : "text-cyan-300";
+        ? "text-emerald-300"
+        : "text-cyan-300";
 
   return (
     <div
@@ -148,46 +148,33 @@ function ResultsContent() {
 
         {/* Winner banner */}
         <div
-          className={`mt-8 rounded-2xl border px-6 py-5 text-center ${
-            data.user_wins
-              ? "border-emerald-400/30 bg-emerald-500/10"
-              : "border-red-400/25 bg-red-500/8"
-          }`}
+          className={`mt-8 rounded-2xl border px-6 py-5 text-center ${data.user_wins
+            ? "border-emerald-400/30 bg-emerald-500/10"
+            : "border-red-400/25 bg-red-500/8"
+            }`}
         >
           <p
-            className={`text-3xl font-bold ${
-              data.user_wins ? "text-emerald-300" : "text-red-300"
-            }`}
+            className={`text-3xl font-bold ${data.user_wins ? "text-emerald-300" : "text-red-300"
+              }`}
           >
-            {data.user_wins ? "🏆 You Win!" : "🤖 AI Wins"}
+            {data.user_wins ? "🏆 You Win!" : "🤖 Not quite!"}
           </p>
           <p className="mt-2 text-sm text-zinc-400">
             {data.user_wins
-              ? "Your self-score matched or beat the AI's assessment."
-              : "The AI scored your project differently — keep building!"}
+              ? `Your self-score (${data.user_score}) matched the average score (${data.avg_score}). Perfect call!`
+              : `Your self-score was ${data.user_score}, but the average was ${data.avg_score}. Try again!`}
           </p>
           {data.page_title && (
             <p className="mt-3 text-xs text-zinc-600 font-mono">{data.page_title}</p>
           )}
         </div>
 
-        {/* Three score cards */}
-        <div className="mt-8 grid grid-cols-3 gap-4">
+        {/* Two score cards */}
+        <div className="mt-8 grid grid-cols-2 gap-4">
           <ScoreCard label="Your Score" value={data.user_score} max={10} color="amber" />
-          <ScoreCard label="AI Score" value={data.ai_score} max={10} color="cyan" />
-          <ScoreCard label="GitHub Score" value={data.github_score} max={10} color="emerald" />
+          <ScoreCard label="Average Score" value={Math.round(data.avg_score)} max={10} color="emerald" />
         </div>
-
-        {/* Avg score */}
-        <div className="mt-4 rounded-2xl border border-white/10 bg-zinc-900/60 px-6 py-4 text-center">
-          <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500">
-            Average Score
-          </p>
-          <p className="mt-1 text-4xl font-bold tabular-nums text-white">
-            {data.avg_score.toFixed(2)}
-            <span className="ml-1 text-xl font-normal text-zinc-500">/ 10</span>
-          </p>
-        </div>
+        <p className="mt-2 text-center text-xs text-zinc-600">Win condition: your score = average score</p>
 
         {/* AI Summary */}
         {data.summary && (
@@ -290,15 +277,14 @@ function ResultsContent() {
               {data.logs.map((line, i) => (
                 <p
                   key={i}
-                  className={`font-mono text-[11px] leading-relaxed ${
-                    line.startsWith("[ERROR]")
-                      ? "text-red-400"
-                      : line.startsWith("[WARN]")
+                  className={`font-mono text-[11px] leading-relaxed ${line.startsWith("[ERROR]")
+                    ? "text-red-400"
+                    : line.startsWith("[WARN]")
                       ? "text-amber-400"
                       : line.startsWith("[Result]")
-                      ? "text-emerald-400"
-                      : "text-zinc-500"
-                  }`}
+                        ? "text-emerald-400"
+                        : "text-zinc-500"
+                    }`}
                 >
                   {line}
                 </p>
