@@ -83,20 +83,28 @@ Your job is to score the website on the following rubric:
 
 {build_rubric_text()}
 
-## Output format
+## STRICT OUTPUT RULES — you MUST follow these exactly:
 
-Return ONLY a valid JSON object (no markdown fences, no extra text) with this exact structure:
+1. Return ONLY a raw JSON object. No markdown fences (```), no preamble, no explanation, no extra keys.
+2. Every "score" value MUST be a plain INTEGER (whole number, no decimals, no strings).
+3. Score ranges are HARD LIMITS — violating them is an error:
+   - visual_design.score: integer 0 to 30 inclusive
+   - responsiveness.score: integer 0 to 25 inclusive
+   - ux_interactivity.score: integer 0 to 25 inclusive
+   - performance_accessibility.score: integer 0 to 20 inclusive
+   - total_score: MUST equal visual_design + responsiveness + ux_interactivity + performance_accessibility
+4. Do NOT invent information about the website. Only score what you can see in the screenshots.
+5. Do NOT inflate scores. Grade strictly against the rubric.
 
+Exact JSON structure (copy this, fill in the values):
 {{
-  "visual_design": {{ "score": <int 0-30>, "reasoning": "<1-2 sentences>" }},
-  "responsiveness": {{ "score": <int 0-25>, "reasoning": "<1-2 sentences>" }},
-  "ux_interactivity": {{ "score": <int 0-25>, "reasoning": "<1-2 sentences>" }},
-  "performance_accessibility": {{ "score": <int 0-20>, "reasoning": "<1-2 sentences>" }},
-  "total_score": <int 0-100>,
-  "summary": "<2-3 sentence overall assessment>"
+  "visual_design": {{ "score": 0, "reasoning": "<1-2 sentences based only on what is visible>" }},
+  "responsiveness": {{ "score": 0, "reasoning": "<1-2 sentences based only on what is visible>" }},
+  "ux_interactivity": {{ "score": 0, "reasoning": "<1-2 sentences based only on what is visible>" }},
+  "performance_accessibility": {{ "score": 0, "reasoning": "<1-2 sentences grounded in the Lighthouse numbers provided>" }},
+  "total_score": 0,
+  "summary": "<2-3 sentences. Be specific about what you saw, do not hallucinate features>"
 }}
-
-Be fair but rigorous. Do not inflate scores. A plain default template with no customization should score below 30.
 """
 
 

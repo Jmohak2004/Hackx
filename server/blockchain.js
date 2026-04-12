@@ -11,7 +11,7 @@ const { ethers } = require("ethers");
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CONTRACT_ADDRESS = "0x13a8638041b2825937756e19b775536c0150f429";
+const CONTRACT_ADDRESS = "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
 
 const SEPOLIA_RPC =
   process.env.SEPOLIA_RPC_URL ||

@@ -688,12 +688,6 @@ export function AuthWizard() {
       // User rejected in MetaMask
       if (msg.includes("User rejected") || msg.includes("user rejected")) {
         setStakeError("Transaction was rejected. Click again to retry.");
-      } else if (msg.includes("AlreadyEntered")) {
-        // User already entered this round — skip staking, proceed to analysis
-        setStakeError("");
-        setIsStaking(false);
-        setStep(5);
-        return;
       } else {
         setStakeError(`Staking failed: ${msg.slice(0, 200)}`);
       }
