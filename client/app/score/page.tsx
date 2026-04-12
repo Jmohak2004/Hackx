@@ -67,9 +67,9 @@ const viemPublicClient = createPublicClient({
   transport: rpcUrl
     ? http(rpcUrl)
     : fallback([
-        http("https://ethereum-sepolia-rpc.publicnode.com"),
-        http("https://sepolia.drpc.org"),
-      ]),
+      http("https://ethereum-sepolia-rpc.publicnode.com"),
+      http("https://sepolia.drpc.org"),
+    ]),
 });
 
 // --- Blockchain Helpers ---
@@ -79,9 +79,9 @@ async function ensureWalletOnSepolia() {
     throw new Error("No wallet detected. Install MetaMask.");
   }
 
-  const currentChainId = await window.ethereum.request({
+  const currentChainId = (await window.ethereum.request({
     method: "eth_chainId",
-  });
+  })) as string;
 
   if (currentChainId?.toLowerCase() === SEPOLIA_CHAIN_ID_HEX) return;
 
@@ -113,9 +113,12 @@ async function ensureWalletOnSepolia() {
 async function claimPrizeOnChain(entryId: bigint): Promise<string> {
   await ensureWalletOnSepolia();
 
-  const accounts = await window.ethereum.request({
+  if (!window.ethereum) throw new Error("No wallet detected.");
+  const ethereum = window.ethereum;
+
+  const accounts = (await ethereum.request({
     method: "eth_requestAccounts",
-  });
+  })) as string[];
 
   if (!accounts?.length) {
     throw new Error("No wallet connected.");
@@ -126,7 +129,8 @@ async function claimPrizeOnChain(entryId: bigint): Promise<string> {
   const walletClient = createWalletClient({
     account: walletAddress,
     chain: sepolia,
-    transport: custom(window.ethereum as any),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    transport: custom(ethereum as any),
   });
 
   let gasLimit = FALLBACK_CLAIM_GAS;
@@ -228,16 +232,14 @@ function ResultsContent() {
       />
 
       <div className="relative z-10 flex flex-col items-center">
-        <p className="mt-6 text-sm text-zinc-400 text-center max-w-md">
-          {scoresMatch ? "Perfect match with AI 🎯" : "Mismatch — check breakdown below"}
-        </p>
-
         {scoresMatch && (
           <div className="mt-6 text-center">
             {effectiveClaimTxHash ? (
               <div className="space-y-2">
-                <p className="text-xs text-emerald-300">Prize Claimed Successfully!</p>
-                <p className="text-[10px] text-zinc-500 font-mono break-all max-w-xs">
+                <p className="font-[family-name:var(--font-geist-sans)] text-sm font-semibold tracking-wide text-emerald-300">
+                  Prize Claimed Successfully!
+                </p>
+                <p className="font-[family-name:var(--font-geist-mono)] text-[10px] text-zinc-500 break-all max-w-xs">
                   TX: {effectiveClaimTxHash}
                 </p>
               </div>
@@ -245,19 +247,28 @@ function ResultsContent() {
               <button
                 onClick={handleClaimPrize}
                 disabled={claimStatus === "pending"}
-                className="mt-3 rounded-xl bg-emerald-500 px-6 py-2.5 text-sm font-bold text-black hover:bg-emerald-400 disabled:opacity-50 transition-colors"
+                className="font-[family-name:var(--font-geist-sans)] rounded-xl bg-gradient-to-b from-amber-400 to-amber-600 px-8 py-3 text-sm font-bold tracking-wide text-zinc-950 shadow-lg shadow-amber-900/40 transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {claimStatus === "pending" ? "Claiming..." : "Claim Prize"}
+                {claimStatus === "pending" ? "Claiming…" : "Claim Prize"}
               </button>
             ) : (
-              <p className="text-xs text-zinc-500 italic">No entry ID found — cannot claim prize</p>
+              <p className="font-[family-name:var(--font-geist-sans)] text-xs text-zinc-500 italic">
+                No entry ID found — cannot claim prize
+              </p>
             )}
 
-            {claimError && <p className="text-xs text-red-400 mt-3 max-w-xs">{claimError}</p>}
+            {claimError && (
+              <p className="font-[family-name:var(--font-geist-sans)] mt-3 text-xs text-red-400 max-w-xs">
+                {claimError}
+              </p>
+            )}
           </div>
         )}
 
-        <Link href="/" className="mt-10 text-sm text-zinc-500 hover:text-white transition-colors underline underline-offset-4">
+        <Link
+          href="/"
+          className="font-[family-name:var(--font-geist-sans)] mt-10 text-sm text-zinc-500 transition-colors hover:text-white underline underline-offset-4"
+        >
           Back to home
         </Link>
       </div>
