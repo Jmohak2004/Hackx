@@ -11,11 +11,12 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
 
-const CONTRACT_ADDRESS = "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
-const AGENT_ADDRESS = "0x65Fa1E64D9308435dF1E190176259d3BC74CFCEF";
+const CONTRACT_ADDRESS =
+  process.env.GAME_CONTRACT_ADDRESS || "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
+const AGENT_ADDRESS = process.env.AGENT_ADDRESS || "0x65Fa1E64D9308435dF1E190176259d3BC74CFCEF";
 
 const SEPOLIA_RPC =
-  process.env.SEPOLIA_RPC_URL || "https://eth-sepolia.g.alchemy.com/v2/TLt86pNqz_12PUesDDjQG";
+  process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com";
 
 const ABI = [
   "function setTrustedAgent(address agent, bool trusted)",

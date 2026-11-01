@@ -5,6 +5,7 @@ a GitHub repository and returns structured graph stats.
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -12,8 +13,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GRAPHIFY_BASE_URL = "http://localhost:4000"
-ANALYZE_TIMEOUT = 120  # seconds — pipeline can take a while
+GRAPHIFY_BASE_URL = os.getenv("GRAPHIFY_API_URL", "http://localhost:4000").rstrip("/")
+ANALYZE_TIMEOUT = float(os.getenv("GRAPHIFY_TIMEOUT_SECONDS", "300"))
 
 
 @dataclass

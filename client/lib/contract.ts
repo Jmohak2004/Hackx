@@ -6,7 +6,8 @@ import { sepolia } from "viem/chains";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const GAME_CONTRACT_ADDRESS: Address =
-  "0xc2df02602efd8e4459064bb752c8bd1da0f8d6a8";
+  (process.env.NEXT_PUBLIC_GAME_CONTRACT_ADDRESS ||
+    "0xc2df02602efd8e4459064bb752c8bd1da0f8d6a8") as Address;
 
 export const SUPPORTED_CHAIN = sepolia;
 
