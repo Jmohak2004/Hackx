@@ -11,7 +11,8 @@ const { ethers } = require("ethers");
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CONTRACT_ADDRESS = "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
+const CONTRACT_ADDRESS =
+  process.env.GAME_CONTRACT_ADDRESS || "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
 
 const SEPOLIA_RPC =
   process.env.SEPOLIA_RPC_URL ||
@@ -94,6 +95,9 @@ async function getCurrentRound() {
   const roundId = await contract.currentRoundId();
   if (roundId === 0n) return null;
   const round = await contract.getRound(roundId);
+  if (!round.isActive || BigInt(Math.floor(Date.now() / 1000)) > round.endTime) {
+    return null;
+  }
   return {
     id: roundId.toString(),
     startTime: Number(round.startTime),
@@ -111,6 +115,7 @@ async function getCurrentRound() {
 async function getEntry(entryId) {
   const contract = getReadContract();
   const entry = await contract.getEntry(BigInt(entryId));
+  const round = await contract.getRound(entry.roundId);
   return {
     participant: entry.participant,
     roundId: entry.roundId.toString(),
@@ -122,6 +127,7 @@ async function getEntry(entryId) {
     scored: entry.scored,
     claimed: entry.claimed,
     isWinner: entry.isWinner,
+    judgingDeadline: Number(round.judgingDeadline),
   };
 }
 

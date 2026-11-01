@@ -6,9 +6,15 @@ const blockchain = require("./blockchain");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const SCORING_API_URL = (process.env.SCORING_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+const evaluationsInProgress = new Set();
 
-app.use(cors());
-app.use(express.json());
+const allowedOrigins = (process.env.CORS_ALLOW_ORIGINS || "http://localhost:3000,http://127.0.0.1:3000")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+app.use(cors({ origin: allowedOrigins }));
+app.use(express.json({ limit: "64kb" }));
 
 // GET /api/graphs — list all cached graphs
 app.get("/api/graphs", (req, res) => {
@@ -84,28 +90,81 @@ app.get("/api/blockchain/entry-for/:roundId/:address", async (req, res) => {
   }
 });
 
-// POST /api/blockchain/submit-score — submit AI verified score on-chain
-// Body: { entryId, verifiedScore (0-100), proofHash }
-app.post("/api/blockchain/submit-score", async (req, res) => {
-  const { entryId, verifiedScore, proofHash } = req.body;
-
-  if (entryId === undefined || verifiedScore === undefined) {
-    return res.status(400).json({ error: "entryId and verifiedScore are required" });
+// Evaluate the immutable links and self-score stored in the entry itself.
+// The browser cannot choose an arbitrary score for the trusted server wallet.
+app.post("/api/blockchain/evaluate-entry", async (req, res) => {
+  const { entryId } = req.body || {};
+  if (typeof entryId !== "string" || !/^\d{1,78}$/.test(entryId) || BigInt(entryId) === 0n) {
+    return res.status(400).json({ error: "A positive integer entryId is required" });
   }
-  if (verifiedScore < 0 || verifiedScore > 100) {
-    return res.status(400).json({ error: "verifiedScore must be 0-100" });
+  if (evaluationsInProgress.has(entryId)) {
+    return res.status(409).json({ error: "This entry is already being evaluated" });
   }
 
+  evaluationsInProgress.add(entryId);
   try {
-    const result = await blockchain.submitVerifiedScore(
+    const entry = await blockchain.getEntry(entryId);
+    if (!entry || /^0x0{40}$/i.test(entry.participant)) {
+      return res.status(404).json({ error: "Entry was not found on Sepolia" });
+    }
+    if (entry.scored) {
+      return res.status(409).json({ error: "This entry already has a verified score" });
+    }
+
+    const hostedUrl = entry.websiteUrl && entry.websiteUrl !== entry.githubUrl
+      ? entry.websiteUrl
+      : null;
+    const scoringResponse = await fetch(`${SCORING_API_URL}/score`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        github_url: entry.githubUrl,
+        hosted_url: hostedUrl,
+        self_score: entry.selfScore / 10,
+      }),
+      signal: AbortSignal.timeout(300_000),
+    });
+    const responseText = await scoringResponse.text();
+    if (!scoringResponse.ok) {
+      return res.status(502).json({
+        error: `Scoring service returned ${scoringResponse.status}: ${responseText.slice(0, 500)}`,
+      });
+    }
+
+    let scoreResult;
+    try {
+      scoreResult = JSON.parse(responseText);
+    } catch {
+      return res.status(502).json({ error: "Scoring service returned invalid JSON" });
+    }
+    const aiScore = Number(scoreResult.ai_score);
+    if (!Number.isFinite(aiScore) || aiScore < 0 || aiScore > 10) {
+      return res.status(502).json({ error: "Scoring service returned an invalid score" });
+    }
+
+    const verifiedScore = Math.round(aiScore * 10);
+    const chainResult = await blockchain.submitVerifiedScore(
       entryId,
-      Math.round(verifiedScore),
-      proofHash || ""
+      verifiedScore,
+      `score-${verifiedScore}-${Date.now()}`
     );
-    res.json(result);
+    res.json({
+      ...scoreResult,
+      chain: {
+        entryId: entryId.toString(),
+        roundId: entry.roundId,
+        claimableAfter: entry.judgingDeadline,
+        scoreTxHash: chainResult.txHash,
+        isWinnerOnChain: chainResult.isWinner,
+        claimTxHash: null,
+      },
+    });
   } catch (err) {
-    console.error("[blockchain] Error submitting score:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error(`[blockchain] Failed to evaluate entry ${entryId}:`, err.message);
+    const timedOut = err.name === "TimeoutError" || err.name === "AbortError";
+    res.status(timedOut ? 504 : 502).json({ error: err.message || "Entry evaluation failed" });
+  } finally {
+    evaluationsInProgress.delete(entryId);
   }
 });
 
@@ -130,6 +189,6 @@ app.listen(PORT, () => {
   console.log(`   POST /api/analyze          { "githubUrl": "..." }`);
   console.log(`   GET  /api/blockchain/round`);
   console.log(`   GET  /api/blockchain/entry/:entryId`);
-  console.log(`   POST /api/blockchain/submit-score  { entryId, verifiedScore, proofHash }`);
+  console.log(`   POST /api/blockchain/evaluate-entry  { entryId }`);
   console.log(`   GET  /api/blockchain/agent-info\n`);
 });

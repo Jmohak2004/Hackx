@@ -48,6 +48,7 @@ interface ScoreData {
   chain?: {
     entryId: string | null;
     roundId: string | null;
+    claimableAfter?: number;
     scoreTxHash: string | null;
     isWinnerOnChain: boolean | null;
     claimTxHash: string | null;
@@ -90,8 +91,8 @@ async function ensureWalletOnSepolia() {
       method: "wallet_switchEthereumChain",
       params: [{ chainId: SEPOLIA_CHAIN_ID_HEX }],
     });
-  } catch (err: any) {
-    if (err.code === 4902) {
+    } catch (err: unknown) {
+      if (typeof err === "object" && err !== null && "code" in err && err.code === 4902) {
       await window.ethereum.request({
         method: "wallet_addEthereumChain",
         params: [
@@ -170,7 +171,27 @@ function ResultsContent() {
   const [claimStatus, setClaimStatus] = useState<"idle" | "pending" | "success" | "error">("idle");
   const [claimError, setClaimError] = useState<string | null>(null);
   const [claimTxHash, setClaimTxHash] = useState<string | null>(null);
+  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const confettiOnce = useRef(false);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowSeconds(Math.floor(Date.now() / 1000)), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(decodeURIComponent(raw)) as ScoreData;
+      const matches = Math.round(Number(parsed.user_score)) === Math.round(Number(parsed.ai_score));
+      if (matches && !confettiOnce.current) {
+        confettiOnce.current = true;
+        runJudgeMatchConfetti();
+      }
+    } catch {
+      // The page below renders the parse error state.
+    }
+  }, [raw]);
 
   if (!raw) {
     return (
@@ -200,14 +221,11 @@ function ResultsContent() {
   const scoresMatch = Math.round(Number(data.user_score)) === Math.round(Number(data.ai_score));
   const resultVariant = scoresMatch ? "match" : "mismatch";
 
-  useEffect(() => {
-    if (!scoresMatch || confettiOnce.current) return;
-    confettiOnce.current = true;
-    runJudgeMatchConfetti();
-  }, [scoresMatch]);
-
   const chainEntryId = data.chain?.entryId ?? null;
   const effectiveClaimTxHash = claimTxHash ?? data.chain?.claimTxHash ?? null;
+  const canClaim = data.chain?.isWinnerOnChain ?? scoresMatch;
+  const claimableAfter = data.chain?.claimableAfter;
+  const claimWindowOpen = claimableAfter === undefined || nowSeconds >= claimableAfter;
 
   const handleClaimPrize = async () => {
     if (!chainEntryId) return;
@@ -217,8 +235,8 @@ function ResultsContent() {
       const tx = await claimPrizeOnChain(BigInt(chainEntryId));
       setClaimTxHash(tx);
       setClaimStatus("success");
-    } catch (err: any) {
-      setClaimError(err.message || "Failed to claim prize");
+    } catch (err: unknown) {
+      setClaimError(err instanceof Error ? err.message : "Failed to claim prize");
       setClaimStatus("error");
     }
   };
@@ -232,7 +250,7 @@ function ResultsContent() {
       />
 
       <div className="relative z-10 flex flex-col items-center">
-        {scoresMatch && (
+        {canClaim && (
           <div className="mt-6 text-center">
             {effectiveClaimTxHash ? (
               <div className="space-y-2">
@@ -243,7 +261,7 @@ function ResultsContent() {
                   TX: {effectiveClaimTxHash}
                 </p>
               </div>
-            ) : chainEntryId ? (
+            ) : chainEntryId && claimWindowOpen ? (
               <button
                 onClick={handleClaimPrize}
                 disabled={claimStatus === "pending"}
@@ -251,6 +269,10 @@ function ResultsContent() {
               >
                 {claimStatus === "pending" ? "Claiming…" : "Claim Prize"}
               </button>
+            ) : chainEntryId ? (
+              <p className="font-[family-name:var(--font-geist-sans)] text-xs text-zinc-500 italic">
+                Prize claims open after the round&apos;s judging deadline.
+              </p>
             ) : (
               <p className="font-[family-name:var(--font-geist-sans)] text-xs text-zinc-500 italic">
                 No entry ID found — cannot claim prize

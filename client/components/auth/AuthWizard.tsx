@@ -119,33 +119,6 @@ async function stakeAndEnterGame(
   return { entryId, txHash: hash };
 }
 
-/**
- * Call claimPrize on the contract from the user's wallet.
- */
-async function claimPrizeOnChain(
-  walletAddress: Address,
-  entryId: bigint
-): Promise<string> {
-  await ensureWalletOnSepolia();
-
-  const walletClient = createWalletClient({
-    account: walletAddress,
-    chain: sepolia,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    transport: custom(window.ethereum as any),
-  });
-
-  const hash = await walletClient.writeContract({
-    address: GAME_CONTRACT_ADDRESS,
-    abi: GAME_ABI,
-    functionName: "claimPrize",
-    args: [entryId],
-  });
-
-  await viemPublicClient.waitForTransactionReceipt({ hash });
-  return hash;
-}
-
 /** Three sequential plays (left panel). Uses one file three times until load_2.mp4 / load_3.mp4 exist in public/images. */
 const LOADER_CLIPS = [
   "/images/load_1.mp4",
@@ -188,7 +161,9 @@ function isValidGithubUrl(raw: string): boolean {
   try {
     const u = new URL(raw.trim());
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-    return /github\.com$/i.test(u.hostname.replace(/^www\./, ""));
+    if (u.hostname.toLowerCase() !== "github.com") return false;
+    const parts = u.pathname.split("/").filter(Boolean);
+    return parts.length === 2 && parts.every((part) => part !== "." && part !== "..");
   } catch {
     return false;
   }
@@ -205,32 +180,23 @@ function isValidOptionalHostedUrl(raw: string): boolean {
   }
 }
 
-const AI_API_BASE =
-  process.env.NEXT_PUBLIC_AI_API_URL ?? "http://localhost:8000";
-
 type PhaseStatus = "pending" | "active" | "done" | "error";
 
 function ProcessingLoader({
   githubUrl,
   hostedUrl,
   selfScore,
-  walletAddress,
   entryId,
   roundId,
-  onComplete,
 }: {
   githubUrl: string;
   hostedUrl: string;
   selfScore: number;
-  walletAddress: Address | undefined;
   entryId: bigint | null;
   roundId: bigint | null;
-  onComplete: () => void;
 }) {
   const router = useRouter();
   const [clipIndex, setClipIndex] = useState(0);
-  const clipIndexRef = useRef(0);
-  clipIndexRef.current = clipIndex;
 
   const [phaseStatuses, setPhaseStatuses] = useState<PhaseStatus[]>([
     "active", "pending", "pending",
@@ -238,6 +204,7 @@ function ProcessingLoader({
   const [logs, setLogs] = useState<string[]>([]);
   const [apiError, setApiError] = useState<string | null>(null);
   const hasCalled = useRef(false);
+  const [retryCount, setRetryCount] = useState(0);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   const pushLog = useCallback((msg: string) => {
@@ -253,24 +220,18 @@ function ProcessingLoader({
     hasCalled.current = true;
 
     async function runPipeline() {
-      pushLog(`[UI] Calling AI scoring API at ${AI_API_BASE}/score`);
-      pushLog(`[UI] github_url=${githubUrl}`);
-      pushLog(`[UI] hosted_url=${hostedUrl}`);
-      pushLog(`[UI] self_score=${selfScore}`);
-      if (entryId) pushLog(`[Chain] On-chain entryId=${entryId.toString()}`);
+      pushLog(`[UI] Starting entry evaluation through ${SERVER_API_BASE}`);
+      if (entryId) pushLog(`[Chain] Reading on-chain entry ${entryId.toString()}`);
 
       setPhaseStatuses(["active", "pending", "pending"]);
 
       try {
-        // ── Phase 1: AI Scoring ─────────────────────────────────────────
-        const resp = await fetch(`${AI_API_BASE}/score`, {
+        // The server reads the committed links and self-score from Sepolia,
+        // evaluates those values, and submits that result with its trusted key.
+        const resp = await fetch(`${SERVER_API_BASE}/api/blockchain/evaluate-entry`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            github_url: githubUrl,
-            hosted_url: hostedUrl,
-            self_score: selfScore,
-          }),
+          body: JSON.stringify({ entryId: entryId?.toString() }),
         });
 
         setPhaseStatuses(["done", "active", "pending"]);
@@ -298,75 +259,10 @@ function ProcessingLoader({
         setPhaseStatuses(["done", "done", "active"]);
         pushLog(`[UI] Scores received — user=${data.user_score} ai=${data.ai_score} github=${data.github_score} avg=${data.avg_score}`);
 
-        // ── Phase 2: On-chain score verification ────────────────────────
-        let chainResult: {
-          txHash?: string;
-          isWinner?: boolean;
-          claimTxHash?: string;
-        } = {};
-
-        if (entryId && walletAddress) {
-          pushLog(`[Chain] Submitting verified score on-chain…`);
-          // AI score is 1-10, contract expects 0-100
-          const verifiedScore100 = Math.round(data.ai_score * 10);
-
-          try {
-            const scoreResp = await fetch(
-              `${SERVER_API_BASE}/api/blockchain/submit-score`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  entryId: entryId.toString(),
-                  verifiedScore: verifiedScore100,
-                  proofHash: `score-${data.ai_score}-${Date.now()}`,
-                }),
-              }
-            );
-
-            if (!scoreResp.ok) {
-              const errText = await scoreResp.text();
-              pushLog(`[Chain] WARNING: Score submission failed — ${errText}`);
-            } else {
-              const scoreData = await scoreResp.json();
-              chainResult.txHash = scoreData.txHash;
-              chainResult.isWinner = scoreData.isWinner;
-              pushLog(
-                `[Chain] Score verified on-chain! tx=${scoreData.txHash}`
-              );
-              pushLog(
-                `[Chain] Winner: ${scoreData.isWinner ? "YES" : "NO"}`
-              );
-
-              // ── Phase 3: Auto-claim prize if winner ───────────────────
-              if (scoreData.isWinner && walletAddress) {
-                pushLog(`[Chain] You won! Claiming prize to your wallet…`);
-                try {
-                  const claimHash = await claimPrizeOnChain(
-                    walletAddress,
-                    entryId
-                  );
-                  chainResult.claimTxHash = claimHash;
-                  pushLog(
-                    `[Chain] Prize claimed! tx=${claimHash}`
-                  );
-                } catch (claimErr: unknown) {
-                  const claimMsg =
-                    claimErr instanceof Error
-                      ? claimErr.message
-                      : String(claimErr);
-                  pushLog(`[Chain] Prize claim failed: ${claimMsg}`);
-                  pushLog(
-                    `[Chain] You can claim manually later with entryId=${entryId.toString()}`
-                  );
-                }
-              }
-            }
-          } catch (chainErr: unknown) {
-            const chainMsg =
-              chainErr instanceof Error ? chainErr.message : String(chainErr);
-            pushLog(`[Chain] Score submission error: ${chainMsg}`);
-          }
+        const chainResult = data.chain ?? {};
+        if (chainResult.scoreTxHash) {
+          pushLog(`[Chain] Score verified on-chain! tx=${chainResult.scoreTxHash}`);
+          pushLog(`[Chain] Winner: ${chainResult.isWinnerOnChain ? "YES" : "NO"}`);
         }
 
         pushLog(`[UI] user_wins=${data.user_wins}  Redirecting to results page…`);
@@ -378,11 +274,9 @@ function ProcessingLoader({
         const enrichedData = {
           ...data,
           chain: {
+            ...chainResult,
             entryId: entryId?.toString() ?? null,
             roundId: roundId?.toString() ?? null,
-            scoreTxHash: chainResult.txHash ?? null,
-            isWinnerOnChain: chainResult.isWinner ?? null,
-            claimTxHash: chainResult.claimTxHash ?? null,
           },
         };
 
@@ -402,17 +296,15 @@ function ProcessingLoader({
     }
 
     runPipeline();
-  }, [githubUrl, hostedUrl, selfScore, walletAddress, entryId, roundId, pushLog, router]);
+  }, [githubUrl, hostedUrl, selfScore, entryId, roundId, pushLog, router, retryCount]);
 
   const handleEnded = useCallback(() => {
-    const i = clipIndexRef.current;
-    if (i < LOADER_CLIPS.length - 1) setClipIndex(i + 1);
-  }, []);
+    if (clipIndex < LOADER_CLIPS.length - 1) setClipIndex(clipIndex + 1);
+  }, [clipIndex]);
 
   const handleError = useCallback(() => {
-    const i = clipIndexRef.current;
-    if (i < LOADER_CLIPS.length - 1) setClipIndex(i + 1);
-  }, []);
+    if (clipIndex < LOADER_CLIPS.length - 1) setClipIndex(clipIndex + 1);
+  }, [clipIndex]);
 
   return (
     <div className="relative z-20 flex min-h-dvh w-full flex-col bg-black md:min-h-0 md:h-dvh md:flex-row">
@@ -498,6 +390,17 @@ function ProcessingLoader({
           <div className="mt-4 rounded-xl border border-red-400/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
             <p className="font-semibold">Scoring error — details below</p>
             <p className="mt-1 font-mono text-xs break-all">{apiError}</p>
+            <button
+              type="button"
+              className="mt-3 rounded-lg border border-red-300/30 px-3 py-1.5 text-xs font-medium text-red-100 transition-colors hover:bg-red-400/10"
+              onClick={() => {
+                hasCalled.current = false;
+                setApiError(null);
+                setRetryCount((count) => count + 1);
+              }}
+            >
+              Retry evaluation
+            </button>
           </div>
         )}
 
@@ -542,7 +445,6 @@ function ProcessingLoader({
 }
 
 export function AuthWizard() {
-  const router = useRouter();
   const [step, setStep] = useState(1);
   const [name, setName] = useState("");
   const [githubUrl, setGithubUrl] = useState("");
@@ -566,17 +468,14 @@ export function AuthWizard() {
     error: connectError,
   } = useConnect();
 
+  const visibleStep = step === 3 && isConnected && !!address ? 4 : step;
+
   useEffect(() => {
-    if (step !== 4) return;
+    if (visibleStep !== 4) return;
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const t = window.setTimeout(() => runWelcomeConfetti(), 120);
     return () => clearTimeout(t);
-  }, [step]);
-
-  useEffect(() => {
-    if (step !== 3 || !isConnected || !address) return;
-    setStep(4);
-  }, [step, isConnected, address]);
+  }, [visibleStep]);
 
   function submitProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -589,11 +488,11 @@ export function AuthWizard() {
       return;
     }
     if (!gh) {
-      setProfileError("GitHub profile or repo URL is required.");
+      setProfileError("GitHub repository URL is required.");
       return;
     }
     if (!isValidGithubUrl(gh)) {
-      setProfileError("Enter a valid GitHub URL (e.g. https://github.com/you).");
+      setProfileError("Enter a repository URL (e.g. https://github.com/you/project).");
       return;
     }
     if (!isValidOptionalHostedUrl(host)) {
@@ -646,7 +545,6 @@ export function AuthWizard() {
         return;
       }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const roundData = (await viemPublicClient.readContract({
         address: GAME_CONTRACT_ADDRESS,
         abi: GAME_ABI,
@@ -704,7 +602,7 @@ export function AuthWizard() {
 
   return (
     <div className="relative min-h-dvh w-full overflow-hidden text-amber-50">
-      {step <= 4 && (
+      {visibleStep <= 4 && (
         <>
           <Image
             src="/images/authStage.svg"
@@ -726,17 +624,15 @@ export function AuthWizard() {
         </>
       )}
 
-      {step === 5 ? (
+      {visibleStep === 5 ? (
         <ProcessingLoader
           githubUrl={githubUrl}
           hostedUrl={hostedUrl}
           selfScore={Number(score.trim()) || 1}
-          walletAddress={address}
           entryId={entryId}
           roundId={currentRoundId}
-          onComplete={() => router.push("/")}
         />
-      ) : step === 4 ? (
+      ) : visibleStep === 4 ? (
         <div className="relative z-20 flex min-h-dvh flex-col">
           <Link
             href="/"
@@ -801,11 +697,11 @@ export function AuthWizard() {
                     <li
                       key={item.n}
                       className="flex min-w-0 flex-1 items-center"
-                      aria-current={step === item.n ? "step" : undefined}
+                      aria-current={visibleStep === item.n ? "step" : undefined}
                     >
                       {i > 0 ? (
                         <div
-                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${step > STEPS[i - 1]!.n ? "bg-amber-500/50" : "bg-white/10"
+                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${visibleStep > STEPS[i - 1]!.n ? "bg-amber-500/50" : "bg-white/10"
                             }`}
                           aria-hidden
                         />
@@ -814,23 +710,23 @@ export function AuthWizard() {
                       )}
                       <div className="flex shrink-0 flex-col items-center gap-2 px-2">
                         <span
-                          className={`flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold transition-all duration-300 ${step === item.n
+                          className={`flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold transition-all duration-300 ${visibleStep === item.n
                             ? "bg-amber-400 text-zinc-950 ring-2 ring-amber-200/50 shadow-[0_0_20px_rgba(251,191,36,0.35)]"
-                            : step > item.n
+                            : visibleStep > item.n
                               ? "border border-amber-500/40 bg-amber-600/25 text-amber-100"
                               : "border border-white/10 bg-black/30 text-white/40"
                             }`}
                         >
-                          {step > item.n ? (
+                          {visibleStep > item.n ? (
                             <svg className="h-4 w-4" viewBox="0 0 16 16" fill="none">
                               <path d="M3 8l3.5 3.5L13 5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
                             </svg>
                           ) : item.n}
                         </span>
                         <span
-                          className={`text-[0.65rem] font-medium uppercase tracking-wide transition-colors duration-300 sm:text-[11px] ${step === item.n
+                          className={`text-[0.65rem] font-medium uppercase tracking-wide transition-colors duration-300 sm:text-[11px] ${visibleStep === item.n
                             ? "text-amber-200/90"
-                            : step > item.n
+                            : visibleStep > item.n
                               ? "text-amber-100/55"
                               : "text-white/30"
                             }`}
@@ -840,7 +736,7 @@ export function AuthWizard() {
                       </div>
                       {i < STEPS.length - 1 ? (
                         <div
-                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${step > item.n ? "bg-amber-500/50" : "bg-white/10"
+                          className={`h-px min-w-2 flex-1 transition-colors duration-300 ${visibleStep > item.n ? "bg-amber-500/50" : "bg-white/10"
                             }`}
                           aria-hidden
                         />
@@ -854,7 +750,7 @@ export function AuthWizard() {
 
               {/* Panel */}
               <div className={panelClass}>
-                {step === 1 && (
+                {visibleStep === 1 && (
                   <form onSubmit={submitProfile} className="flex flex-col gap-4">
                     <div>
                       <h1 className="text-xl font-semibold tracking-tight text-white">
@@ -921,7 +817,7 @@ export function AuthWizard() {
                   </form>
                 )}
 
-                {step === 2 && (
+                {visibleStep === 2 && (
                   <form onSubmit={submitScore} className="flex flex-col gap-6">
                     <div className="space-y-1">
                       <h1 className="text-xl font-semibold tracking-tight text-white">
@@ -977,7 +873,7 @@ export function AuthWizard() {
                   </form>
                 )}
 
-                {step === 3 && (
+                {visibleStep === 3 && (
                   <div className="flex flex-col gap-6">
                     <div className="space-y-1">
                       <h1 className="text-xl font-semibold tracking-tight text-white">
