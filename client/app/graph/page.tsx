@@ -1,4 +1,3 @@
-// @ts-nocheck — d3 drag/selection generics clash with @types/d3.
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -39,7 +38,7 @@ interface CachedGraph {
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const API_BASE = "http://localhost:4000";
+const API_BASE = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://localhost:4000";
 
 const NODE_COLORS: Record<string, string> = {
   Repo:        "#f97316",
@@ -102,6 +101,8 @@ export default function GraphPage() {
   // ── Load graph when selection changes
   useEffect(() => {
     if (!selectedId) return;
+    // The fetch is external work; these flags describe its pending state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
     setError("");
     fetch(`${API_BASE}/api/graph/${selectedId}`)
@@ -190,12 +191,12 @@ export default function GraphPage() {
 
     // Nodes group
     const nodeG = g.append("g")
-      .selectAll("g")
+      .selectAll<SVGGElement, GraphNode>("g")
       .data(nodes)
       .join("g")
       .attr("cursor", "pointer")
       .call(
-        d3.drag<SVGGElement, GraphNode>()
+        d3.drag<SVGGElement, GraphNode, GraphNode>()
           .on("start", (event, d) => {
             if (!event.active) simulation.alphaTarget(0.3).restart();
             d.fx = d.x; d.fy = d.y;

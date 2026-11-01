@@ -141,16 +141,19 @@ function Sparkles() {
   >([]);
 
   useEffect(() => {
-    setParticles(
-      Array.from({ length: 14 }, (_, i) => ({
-        id: i,
-        x: Math.random() * 100,
-        y: Math.random() * 100,
-        size: 2 + Math.random() * 3,
-        delay: WAIT_DURATION + Math.random() * 1.2,
-        duration: 1.5 + Math.random() * 2,
-      }))
-    );
+    const frame = window.requestAnimationFrame(() => {
+      setParticles(
+        Array.from({ length: 14 }, (_, i) => ({
+          id: i,
+          x: Math.random() * 100,
+          y: Math.random() * 100,
+          size: 2 + Math.random() * 3,
+          delay: WAIT_DURATION + Math.random() * 1.2,
+          duration: 1.5 + Math.random() * 2,
+        }))
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   if (particles.length === 0) return null;
