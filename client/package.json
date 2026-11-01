@@ -15,10 +15,10 @@
     "d3": "^7.9.0",
     "framer-motion": "^12.38.0",
     "lucide-react": "^1.8.0",
-    "next": "16.2.3",
+    "next": "16.4.3",
     "react": "19.2.4",
     "react-dom": "19.2.4",
-    "viem": "^2.47.12",
+    "viem": "2.57.14",
     "wagmi": "^3.6.1"
   },
   "devDependencies": {
@@ -29,8 +29,11 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.2.3",
+    "eslint-config-next": "16.4.3",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "overrides": {
+    "protobufjs": "7.6.6"
   }
 }
