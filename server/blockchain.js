@@ -1,227 +1,276 @@
-/**
- * Blockchain service — trusted-agent wallet for on-chain score submission.
- *
- * Uses ethers.js v6 to interact with the LatentStyleGame contract on Sepolia.
- * The server wallet must be registered as a trustedAgent on the contract.
- */
-
 const { ethers } = require("ethers");
+const { abi: GAME_ABI } = require("./game-artifact.json");
+const { AppError, uintId } = require("./lib/errors");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
-// ─────────────────────────────────────────────────────────────────────────────
+function createBlockchain(options = {}) {
+  const CHAIN_ID = Number(options.chainId || process.env.CHAIN_ID || 11155111);
+  if (![11155111, 31337].includes(CHAIN_ID)) throw new Error("Only Sepolia or a local development chain is supported");
+  const configuredAddress = options.address || process.env.GAME_CONTRACT_ADDRESS ||
+    "0xc2df02602efd8e4459064bb752c8bd1da0f8d6a8";
+  if (!ethers.isAddress(configuredAddress)) throw new Error("GAME_CONTRACT_ADDRESS is invalid");
+  const CONTRACT_ADDRESS = configuredAddress.toLowerCase();
+  const rpcUrl = options.rpcUrl || process.env.RPC_URL || process.env.SEPOLIA_RPC_URL ||
+    (CHAIN_ID === 31337 ? "http://127.0.0.1:8545" : "https://ethereum-sepolia-rpc.publicnode.com");
+  let provider = options.provider;
+  let readContract;
+  let wallet;
+  let nonceManager;
+  let versionPromise;
+  let transactionQueue = Promise.resolve();
+  const leaderboardCache = new Map();
 
-const CONTRACT_ADDRESS =
-  process.env.GAME_CONTRACT_ADDRESS || "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
-
-const SEPOLIA_RPC =
-  process.env.SEPOLIA_RPC_URL ||
-  "https://ethereum-sepolia-rpc.publicnode.com";
-
-// Minimal ABI — only the functions the server needs
-const GAME_ABI = [
-  // Views
-  "function currentRoundId() view returns (uint256)",
-  "function entryCounter() view returns (uint256)",
-  "function getRound(uint256 roundId) view returns (tuple(uint256 id, uint256 startTime, uint256 endTime, uint256 judgingDeadline, uint256 stakeAmount, uint256 scoreTolerance, uint256 totalPool, uint256 platformFeePool, uint256 winnersCount, bool isActive, bool feesWithdrawn))",
-  "function getEntry(uint256 entryId) view returns (tuple(address participant, uint256 roundId, uint256 selfScore, uint256 verifiedScore, string githubUrl, string websiteUrl, string proofIpfsHash, bool scored, bool claimed, bool isWinner))",
-  "function getMyEntry(uint256 roundId, address participant) view returns (uint256)",
-  "function getWinnerShare(uint256 roundId) view returns (uint256)",
-  "function trustedAgents(address) view returns (bool)",
-  // Writes (trusted agent)
-  "function submitVerifiedScore(uint256 entryId, uint256 verifiedScore, string proofIpfsHash)",
-  // Events
-  "event ScoreVerified(uint256 indexed entryId, uint256 verifiedScore, bool isWinner, string proofHash)",
-  "event EntrySubmitted(uint256 indexed entryId, uint256 indexed roundId, address indexed participant, uint256 selfScore)",
-];
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PROVIDER & WALLET
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _provider = null;
-let _agentWallet = null;
-let _contract = null;
-let _readContract = null;
-
-function getProvider() {
-  if (!_provider) {
-    _provider = new ethers.JsonRpcProvider(SEPOLIA_RPC);
+  function getProvider() {
+    provider ||= new ethers.JsonRpcProvider(rpcUrl, undefined, { batchMaxCount: 20 });
+    return provider;
   }
-  return _provider;
-}
 
-function getReadContract() {
-  if (!_readContract) {
-    _readContract = new ethers.Contract(
-      CONTRACT_ADDRESS,
-      GAME_ABI,
-      getProvider()
-    );
+  function contract() {
+    readContract ||= new ethers.Contract(CONTRACT_ADDRESS, GAME_ABI, getProvider());
+    return readContract;
   }
-  return _readContract;
-}
 
-function getAgentWallet() {
-  if (!_agentWallet) {
-    const pk = process.env.AGENT_PRIVATE_KEY;
-    if (!pk) {
-      throw new Error(
-        "AGENT_PRIVATE_KEY not set in .env — needed for on-chain score submission"
-      );
+  function agentWallet() {
+    const key = options.privateKey || process.env.AGENT_PRIVATE_KEY;
+    if (!key) throw new AppError(503, "AGENT_NOT_CONFIGURED", "The scoring wallet is not configured");
+    wallet ||= new ethers.Wallet(key, getProvider());
+    return wallet;
+  }
+
+  async function getVersion() {
+    versionPromise ||= contract().VERSION().then(Number).catch((error) => {
+      if (error.code === "CALL_EXCEPTION" || error.code === "BAD_DATA") return 1;
+      versionPromise = undefined;
+      throw error;
+    });
+    return versionPromise;
+  }
+
+  async function chainTimestamp() {
+    const block = await getProvider().getBlock("latest");
+    if (!block) throw new AppError(502, "RPC_UNAVAILABLE", "Latest chain block was not found");
+    return block.timestamp;
+  }
+
+  async function getRound(roundId) {
+    roundId = uintId(String(roundId), "roundId");
+    let round;
+    try { round = await contract().getRound(BigInt(roundId)); } catch (error) {
+      if (error.code === "CALL_EXCEPTION") throw new AppError(404, "ROUND_NOT_FOUND", "Round was not found");
+      throw error;
     }
-    _agentWallet = new ethers.Wallet(pk, getProvider());
-  }
-  return _agentWallet;
-}
-
-function getWriteContract() {
-  if (!_contract) {
-    _contract = new ethers.Contract(
-      CONTRACT_ADDRESS,
-      GAME_ABI,
-      getAgentWallet()
-    );
-  }
-  return _contract;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// READ FUNCTIONS
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function getCurrentRound() {
-  const contract = getReadContract();
-  const roundId = await contract.currentRoundId();
-  if (roundId === 0n) return null;
-  const round = await contract.getRound(roundId);
-  if (!round.isActive || BigInt(Math.floor(Date.now() / 1000)) > round.endTime) {
-    return null;
-  }
-  return {
-    id: roundId.toString(),
-    startTime: Number(round.startTime),
-    endTime: Number(round.endTime),
-    judgingDeadline: Number(round.judgingDeadline),
-    stakeAmount: round.stakeAmount.toString(),
-    stakeAmountEth: ethers.formatEther(round.stakeAmount),
-    scoreTolerance: Number(round.scoreTolerance),
-    totalPool: ethers.formatEther(round.totalPool),
-    winnersCount: Number(round.winnersCount),
-    isActive: round.isActive,
-  };
-}
-
-async function getEntry(entryId) {
-  const contract = getReadContract();
-  const entry = await contract.getEntry(BigInt(entryId));
-  const round = await contract.getRound(entry.roundId);
-  return {
-    participant: entry.participant,
-    roundId: entry.roundId.toString(),
-    selfScore: Number(entry.selfScore),
-    verifiedScore: Number(entry.verifiedScore),
-    githubUrl: entry.githubUrl,
-    websiteUrl: entry.websiteUrl,
-    proofIpfsHash: entry.proofIpfsHash,
-    scored: entry.scored,
-    claimed: entry.claimed,
-    isWinner: entry.isWinner,
-    judgingDeadline: Number(round.judgingDeadline),
-  };
-}
-
-async function getEntryIdForParticipant(roundId, participantAddress) {
-  const contract = getReadContract();
-  const entryId = await contract.getMyEntry(
-    BigInt(roundId),
-    participantAddress
-  );
-  return entryId.toString();
-}
-
-async function getAgentAddress() {
-  return getAgentWallet().address;
-}
-
-async function isAgentTrusted() {
-  const contract = getReadContract();
-  const wallet = getAgentWallet();
-  return contract.trustedAgents(wallet.address);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WRITE FUNCTIONS
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Submit a verified score for an entry on-chain.
- *
- * @param {string|number} entryId  — the on-chain entry ID
- * @param {number} verifiedScore   — AI score on 0-100 scale
- * @param {string} proofHash       — IPFS hash or proof string
- * @returns {{ txHash, isWinner, verifiedScore, entryId }}
- */
-async function submitVerifiedScore(entryId, verifiedScore, proofHash) {
-  const contract = getWriteContract();
-
-  // Sanity checks
-  if (verifiedScore < 0 || verifiedScore > 100) {
-    throw new Error(`verifiedScore must be 0-100, got ${verifiedScore}`);
+    const [now, paused] = await Promise.all([chainTimestamp(), contract().paused()]);
+    if (round.id === 0n) throw new AppError(404, "ROUND_NOT_FOUND", "Round was not found");
+    const endTime = Number(round.endTime);
+    const judgingDeadline = Number(round.judgingDeadline);
+    return {
+      id: round.id.toString(), startTime: Number(round.startTime), endTime, judgingDeadline,
+      stakeAmount: round.stakeAmount.toString(), stakeAmountEth: ethers.formatEther(round.stakeAmount),
+      scoreTolerance: Number(round.scoreTolerance), totalPool: round.totalPool.toString(),
+      totalPoolEth: ethers.formatEther(round.totalPool),
+      platformFeePool: round.platformFeePool.toString(),
+      winnersCount: Number(round.winnersCount), isActive: round.isActive,
+      feesWithdrawn: round.feesWithdrawn, chainTimestamp: now,
+      paused, isOpen: round.isActive && now < endTime && !paused,
+      phase: now < endTime && round.isActive ? (paused ? "paused" : "open") : now <= judgingDeadline && round.isActive ? "judging" : "complete",
+    };
   }
 
-  console.log(
-    `[blockchain] Submitting verified score: entryId=${entryId} score=${verifiedScore} proof=${proofHash}`
-  );
+  async function getCurrentRound() {
+    const id = await contract().currentRoundId();
+    return id === 0n ? null : getRound(id);
+  }
 
-  const tx = await contract.submitVerifiedScore(
-    BigInt(entryId),
-    BigInt(verifiedScore),
-    proofHash || ""
-  );
+  async function getRounds(limit = 20) {
+    const current = await contract().currentRoundId();
+    const ids = [];
+    for (let id = current; id > 0n && ids.length < limit; id--) ids.push(id);
+    return Promise.all(ids.map(getRound));
+  }
 
-  console.log(`[blockchain] Tx submitted: ${tx.hash}`);
-  const receipt = await tx.wait();
-  console.log(
-    `[blockchain] Tx confirmed in block ${receipt.blockNumber}, gas used: ${receipt.gasUsed}`
-  );
+  async function getEntry(entryId) {
+    entryId = uintId(String(entryId));
+    let entry;
+    try { entry = await contract().getEntry(BigInt(entryId)); } catch (error) {
+      if (error.code === "CALL_EXCEPTION") throw new AppError(404, "ENTRY_NOT_FOUND", "Entry was not found");
+      throw error;
+    }
+    if (entry.participant === ethers.ZeroAddress) throw new AppError(404, "ENTRY_NOT_FOUND", "Entry was not found");
+    return {
+      id: entryId, participant: entry.participant, roundId: entry.roundId.toString(),
+      selfScore: Number(entry.selfScore), verifiedScore: Number(entry.verifiedScore),
+      githubUrl: entry.githubUrl, websiteUrl: entry.websiteUrl, proofIpfsHash: entry.proofIpfsHash,
+      scored: entry.scored, claimed: entry.claimed, isWinner: entry.isWinner,
+      contractVersion: await getVersion(),
+    };
+  }
 
-  // Parse ScoreVerified event from receipt
-  let isWinner = false;
-  for (const log of receipt.logs) {
-    try {
-      const parsed = contract.interface.parseLog({
-        topics: log.topics,
-        data: log.data,
-      });
-      if (parsed && parsed.name === "ScoreVerified") {
-        isWinner = parsed.args.isWinner;
-        break;
+  async function getEntryState(entryId) {
+    const entry = await getEntry(entryId);
+    const round = await getRound(entry.roundId);
+    let settlement = null;
+    let canClaimPrize = false;
+    let canClaimRefund = false;
+    let claimAmount = "0";
+    if (entry.contractVersion >= 2) {
+      const preview = await contract().previewSettlement(BigInt(entry.roundId));
+      settlement = {
+        ready: preview.ready, winnerShare: preview.winnerShare.toString(),
+        platformFee: preview.fee.toString(), refundAll: preview.refundAll,
+      };
+      canClaimPrize = !entry.claimed && preview.ready && entry.scored && entry.isWinner;
+      canClaimRefund = !entry.claimed && preview.ready && (preview.refundAll || !entry.scored);
+      claimAmount = canClaimPrize ? preview.winnerShare.toString() : canClaimRefund ? round.stakeAmount : "0";
+    } else {
+      // Legacy deployments remain readable. They do not enforce safe prize
+      // settlement, so this app only offers their expired unjudged refunds.
+      canClaimRefund = !entry.claimed && !entry.scored && round.chainTimestamp > round.judgingDeadline;
+      if (canClaimRefund) claimAmount = round.stakeAmount;
+    }
+    return { entry, round, settlement, canClaimPrize, canClaimRefund, claimAmount };
+  }
+
+  async function getEntries(roundId, { offset = 0, limit = 20, participant } = {}) {
+    roundId = uintId(String(roundId), "roundId");
+    let ids;
+    let total;
+    if (participant) {
+      if (!ethers.isAddress(participant)) throw new AppError(400, "INVALID_ADDRESS", "Participant address is invalid");
+      const all = await contract().getMyEntries(BigInt(roundId), participant);
+      total = all.length;
+      ids = [...all].reverse().slice(offset, offset + limit);
+    } else if (await getVersion() >= 2) {
+      // Contract pages are ascending. The UI can paginate without fetching the
+      // complete entry array or making an unbounded batch of RPC requests.
+      const page = await contract().getRoundEntriesPage(BigInt(roundId), BigInt(offset), BigInt(limit));
+      ids = page.page;
+      total = Number(page.total);
+    } else {
+      const all = await contract().getRoundEntries(BigInt(roundId));
+      total = all.length;
+      ids = all.slice(offset, offset + limit);
+    }
+    const entries = [];
+    for (let index = 0; index < ids.length; index += 6) {
+      entries.push(...await Promise.all(ids.slice(index, index + 6).map(getEntry)));
+    }
+    return { entries, total, offset, limit };
+  }
+
+  async function getEntryIdForParticipant(roundId, participant) {
+    if (!ethers.isAddress(participant)) throw new AppError(400, "INVALID_ADDRESS", "Participant address is invalid");
+    return (await contract().getMyEntry(BigInt(uintId(String(roundId), "roundId")), participant)).toString();
+  }
+
+  async function getLeaderboard(roundId, { offset = 0, limit = 20 } = {}) {
+    roundId = uintId(String(roundId), "roundId");
+    let cached = leaderboardCache.get(roundId);
+    if (!cached || cached.expiresAt < Date.now()) {
+      const first = await getEntries(roundId, { offset: 0, limit: 100 });
+      if (first.total > 5000) {
+        throw new AppError(422, "LEADERBOARD_LIMIT", "This round exceeds the 5,000-entry leaderboard limit");
       }
-    } catch {
-      // Not our event, skip
+      const entries = [...first.entries];
+      for (let start = 100; start < first.total; start += 300) {
+        const pages = [];
+        for (let page = start; page < Math.min(start + 300, first.total); page += 100) {
+          pages.push(getEntries(roundId, { offset: page, limit: 100 }));
+        }
+        for (const page of await Promise.all(pages)) entries.push(...page.entries);
+      }
+      entries.sort((a, b) => Number(b.scored) - Number(a.scored) ||
+        b.verifiedScore - a.verifiedScore ||
+        Math.abs(a.selfScore - a.verifiedScore) - Math.abs(b.selfScore - b.verifiedScore) ||
+        (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+      cached = { expiresAt: Date.now() + 10_000, entries };
+      leaderboardCache.set(roundId, cached);
+      if (leaderboardCache.size > 50) leaderboardCache.delete(leaderboardCache.keys().next().value);
     }
+    return {
+      total: cached.entries.length, offset, limit,
+      entries: cached.entries.slice(offset, offset + limit).map((entry, index) => ({
+        ...entry, rank: entry.scored ? offset + index + 1 : null,
+      })),
+    };
+  }
+
+  async function getAgentAddress() { return agentWallet().address; }
+  async function isAgentTrusted() { return contract().trustedAgents(agentWallet().address); }
+
+  async function getReadiness() {
+    const [network, code, version] = await Promise.all([
+      getProvider().getNetwork(), getProvider().getCode(CONTRACT_ADDRESS), getVersion(),
+    ]);
+    const details = {
+      chainId: Number(network.chainId), expectedChainId: CHAIN_ID,
+      contractAddress: CONTRACT_ADDRESS, contractVersion: version, ready: false, reason: "",
+    };
+    if (Number(network.chainId) !== CHAIN_ID) return { ...details, reason: "The RPC endpoint is on the wrong chain" };
+    if (code === "0x") return { ...details, reason: "No contract is deployed at the configured address" };
+    if (version < 2) return { ...details, reason: "Deploy the version 2 contract before accepting new stakes" };
+    if (!(options.privateKey || process.env.AGENT_PRIVATE_KEY)) {
+      return { ...details, reason: "The trusted scoring wallet is not configured" };
+    }
+    const address = agentWallet().address;
+    const [trusted, balance] = await Promise.all([
+      contract().trustedAgents(address), getProvider().getBalance(address),
+    ]);
+    if (!trusted) return { ...details, agentAddress: address, reason: "The scoring wallet is not trusted by this contract" };
+    if (balance === 0n) return { ...details, agentAddress: address, reason: "The scoring wallet needs test ETH for transaction gas" };
+    return { ...details, agentAddress: address, ready: true, reason: "" };
+  }
+
+  function parseScoreReceipt(receipt) {
+    if (!receipt || receipt.status !== 1) throw new AppError(502, "SCORE_REVERTED", "Score transaction failed");
+    const event = receipt.logs.map((log) => {
+      if (log.address.toLowerCase() !== CONTRACT_ADDRESS) return null;
+      try { return contract().interface.parseLog(log); } catch { return null; }
+    }).find((log) => log?.name === "ScoreVerified");
+    if (!event) throw new AppError(502, "MISSING_SCORE_EVENT", "Score transaction contained no verification event");
+    return {
+      txHash: receipt.hash, blockNumber: receipt.blockNumber,
+      entryId: event.args.entryId.toString(), verifiedScore: Number(event.args.verifiedScore),
+      isWinner: event.args.isWinner,
+    };
+  }
+
+  async function waitForScoreTransaction(hash) {
+    if (!ethers.isHexString(hash, 32)) throw new AppError(400, "INVALID_TRANSACTION", "Invalid score transaction hash");
+    const receipt = await getProvider().waitForTransaction(hash, 1, 180_000);
+    return parseScoreReceipt(receipt);
+  }
+
+  function submitVerifiedScore(entryId, verifiedScore, proofHash, onBroadcast = async () => {}) {
+    const work = async () => {
+      entryId = uintId(String(entryId));
+      if (!Number.isInteger(verifiedScore) || verifiedScore < 0 || verifiedScore > 100) {
+        throw new AppError(400, "INVALID_SCORE", "Verified score must be an integer from 0 to 100");
+      }
+      if (!/^sha256:[a-f0-9]{64}$/.test(proofHash)) throw new AppError(400, "INVALID_PROOF", "A report digest is required");
+      nonceManager ||= new ethers.NonceManager(agentWallet());
+      const writer = new ethers.Contract(CONTRACT_ADDRESS, GAME_ABI, nonceManager);
+      try {
+        await writer.submitVerifiedScore.staticCall(BigInt(entryId), verifiedScore, proofHash);
+        const transaction = await writer.submitVerifiedScore(BigInt(entryId), verifiedScore, proofHash);
+        await onBroadcast(transaction.hash);
+        return parseScoreReceipt(await transaction.wait(1, 180_000));
+      } catch (error) {
+        nonceManager.reset();
+        throw error;
+      }
+    };
+    // Serial signing avoids nonce collisions when separate evaluations finish
+    // simultaneously. Evaluation itself remains bounded and concurrent.
+    const result = transactionQueue.then(work);
+    transactionQueue = result.catch(() => {});
+    return result;
   }
 
   return {
-    txHash: receipt.hash,
-    blockNumber: receipt.blockNumber,
-    isWinner,
-    verifiedScore,
-    entryId: entryId.toString(),
+    CHAIN_ID, CONTRACT_ADDRESS, getVersion, getReadiness, getRounds, getRound, getCurrentRound,
+    getEntry, getEntryState, getEntries, getLeaderboard, getEntryIdForParticipant, getAgentAddress,
+    isAgentTrusted, submitVerifiedScore, waitForScoreTransaction,
+    close: () => provider?.destroy?.(),
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXPORTS
-// ─────────────────────────────────────────────────────────────────────────────
-
-module.exports = {
-  CONTRACT_ADDRESS,
-  getCurrentRound,
-  getEntry,
-  getEntryIdForParticipant,
-  getAgentAddress,
-  isAgentTrusted,
-  submitVerifiedScore,
-};
+module.exports = { ...createBlockchain(), createBlockchain };
