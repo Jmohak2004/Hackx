@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from url_security import normalize_github_url
 
 import httpx
 
@@ -29,6 +30,7 @@ class GraphStats:
 
 @dataclass
 class RepoMetadata:
+    commit_sha: str = ""
     name: str = ""
     description: str = ""
     language: str = ""
@@ -69,7 +71,7 @@ async def analyze_repo(github_url: str) -> CodeAgentResult:
     result = CodeAgentResult(github_url=github_url)
 
     try:
-        github_url = _validate_github_url(github_url)
+        github_url = normalize_github_url(github_url)
     except ValueError as exc:
         result.error = str(exc)
         return result
@@ -81,6 +83,7 @@ async def analyze_repo(github_url: str) -> CodeAgentResult:
             resp = await client.post(
                 f"{GRAPHIFY_BASE_URL}/api/analyze",
                 json={"githubUrl": github_url},
+                headers={"x-hackx-internal-token": os.getenv("GRAPHIFY_INTERNAL_TOKEN", "")},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -118,6 +121,7 @@ async def analyze_repo(github_url: str) -> CodeAgentResult:
                 # Extract metadata
                 meta = graph_data.get("metadata", {})
                 result.metadata = RepoMetadata(
+                    commit_sha=meta.get("commitSha", ""),
                     name=meta.get("name", ""),
                     description=meta.get("description", "") or "",
                     language=meta.get("language", ""),
