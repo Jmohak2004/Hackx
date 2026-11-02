@@ -1,99 +1,60 @@
-/**
- * One-time setup script — run from the contract OWNER wallet.
- *
- * 1. Registers the server agent wallet as a trustedAgent
- * 2. Creates a game round with configurable parameters
- *
- * Usage:
- *   OWNER_PRIVATE_KEY=0x... node setup-contract.js
- */
-
-require("dotenv").config();
+/** Configure an existing version 2 contest. Read-only unless --apply is passed. */
+const path = require("node:path");
+require("dotenv").config({ path: path.resolve(__dirname, ".env") });
+require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 const { ethers } = require("ethers");
-
-const CONTRACT_ADDRESS =
-  process.env.GAME_CONTRACT_ADDRESS || "0xC2df02602eFD8e4459064BB752C8BD1Da0F8D6A8";
-const AGENT_ADDRESS = process.env.AGENT_ADDRESS || "0x65Fa1E64D9308435dF1E190176259d3BC74CFCEF";
-
-const SEPOLIA_RPC =
-  process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com";
-
-const ABI = [
-  "function setTrustedAgent(address agent, bool trusted)",
-  "function createRound(uint256 stakeAmount, uint256 scoreTolerance, uint256 durationSecs, uint256 judgingBuffer)",
-  "function trustedAgents(address) view returns (bool)",
-  "function currentRoundId() view returns (uint256)",
-  "function owner() view returns (address)",
-  "event RoundCreated(uint256 indexed roundId, uint256 stakeAmount, uint256 tolerance, uint256 endTime)",
-  "event AgentUpdated(address indexed agent, bool trusted)",
-];
-
-// ── Round config ───────────���───────────────────────��──────────────────────
-const STAKE_AMOUNT = ethers.parseEther("0.001"); // 0.001 ETH per entry
-const SCORE_TOLERANCE = 10;                      // ±10 on 0-100 scale = ±1 on 1-10 scale
-const DURATION_SECS = 7 * 24 * 60 * 60;         // 7 days submission window
-const JUDGING_BUFFER = 2 * 24 * 60 * 60;         // 2 days for agent to judge
+const { abi } = require("./game-artifact.json");
 
 async function main() {
-  const ownerPK = process.env.OWNER_PRIVATE_KEY;
-  if (!ownerPK) {
-    console.error("Set OWNER_PRIVATE_KEY env var (the wallet that deployed the contract)");
-    console.error("  OWNER_PRIVATE_KEY=0x... node setup-contract.js");
-    process.exit(1);
-  }
-
-  const provider = new ethers.JsonRpcProvider(SEPOLIA_RPC);
-  const ownerWallet = new ethers.Wallet(ownerPK, provider);
-  const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, ownerWallet);
-
-  console.log(`Owner wallet:  ${ownerWallet.address}`);
-  console.log(`Contract:      ${CONTRACT_ADDRESS}`);
-  console.log(`Agent to trust: ${AGENT_ADDRESS}\n`);
-
-  // Verify ownership
-  const contractOwner = await contract.owner();
-  if (contractOwner.toLowerCase() !== ownerWallet.address.toLowerCase()) {
-    console.error(`ERROR: Connected wallet ${ownerWallet.address} is not the contract owner (${contractOwner})`);
-    process.exit(1);
-  }
-
-  // ── Step 1: Register trusted agent ──────────────────────────────────────
-  const alreadyTrusted = await contract.trustedAgents(AGENT_ADDRESS);
-  if (alreadyTrusted) {
-    console.log("[1/2] Agent already trusted. Skipping.");
-  } else {
-    console.log("[1/2] Registering agent as trusted...");
-    const tx1 = await contract.setTrustedAgent(AGENT_ADDRESS, true);
-    console.log(`      tx: ${tx1.hash}`);
-    await tx1.wait();
-    console.log("      Confirmed.");
-  }
-
-  // ── Step 2: Create game round ───────────────────────────────────────────
-  const currentRound = await contract.currentRoundId();
-  console.log(`\n[2/2] Current round ID: ${currentRound}`);
-  console.log(`      Creating new round...`);
-  console.log(`      Stake:     ${ethers.formatEther(STAKE_AMOUNT)} ETH`);
-  console.log(`      Tolerance: ±${SCORE_TOLERANCE} (on 0-100 scale)`);
-  console.log(`      Duration:  ${DURATION_SECS / 86400} days`);
-  console.log(`      Judging:   ${JUDGING_BUFFER / 86400} days buffer`);
-
-  const tx2 = await contract.createRound(
-    STAKE_AMOUNT,
-    SCORE_TOLERANCE,
-    DURATION_SECS,
-    JUDGING_BUFFER
-  );
-  console.log(`      tx: ${tx2.hash}`);
-  const receipt = await tx2.wait();
-  console.log(`      Confirmed in block ${receipt.blockNumber}`);
-
-  const newRoundId = await contract.currentRoundId();
-  console.log(`\n  Round #${newRoundId} is now active!`);
-  console.log("  Setup complete.\n");
+  const address = process.env.GAME_CONTRACT_ADDRESS;
+  if (!ethers.isAddress(address)) throw new Error("Set GAME_CONTRACT_ADDRESS to the deployed version 2 contract");
+  const chainId = Number(process.env.CHAIN_ID || 11155111);
+  if (![11155111, 31337].includes(chainId)) throw new Error("Only Sepolia and local Hardhat are supported");
+  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com");
+  try {
+    if (Number((await provider.getNetwork()).chainId) !== chainId) throw new Error("RPC chain does not match CHAIN_ID");
+    const contract = new ethers.Contract(address, abi, provider);
+    if (await contract.VERSION() !== 2n) throw new Error("Configure a version 2 deployment");
+    const agent = process.env.AGENT_ADDRESS || (process.env.AGENT_PRIVATE_KEY ? new ethers.Wallet(process.env.AGENT_PRIVATE_KEY).address : "");
+    if (!ethers.isAddress(agent) || agent === ethers.ZeroAddress) throw new Error("Set the evaluator's AGENT_ADDRESS or AGENT_PRIVATE_KEY");
+    const stake = ethers.parseEther(process.env.ROUND_STAKE_ETH || "0.001");
+    const tolerance = Number(process.env.ROUND_TOLERANCE || 10);
+    const duration = Number(process.env.ROUND_DURATION_SECONDS || 86400);
+    const buffer = Number(process.env.ROUND_JUDGING_SECONDS || 7200);
+    if (stake < ethers.parseEther("0.001") || stake > ethers.parseEther("10")) throw new Error("Stake must be 0.001–10 ETH");
+    if (!Number.isInteger(tolerance) || tolerance < 0 || tolerance > 20) throw new Error("Tolerance must be 0–20 on the contract scale");
+    if (![duration, buffer].every((value) => Number.isSafeInteger(value) && value > 0)) throw new Error("Round durations must be positive whole seconds");
+    const owner = await contract.owner();
+    const roundId = await contract.currentRoundId();
+    const round = roundId ? await contract.getRound(roundId) : null;
+    const now = (await provider.getBlock("latest")).timestamp;
+    const open = round && now < Number(round.endTime);
+    const trusted = await contract.trustedAgents(agent);
+    const createRound = process.env.CREATE_ROUND === "true" && !open;
+    console.log(JSON.stringify({ chainId, contractAddress: address, owner, agent, trusted, currentRound: roundId.toString(),
+      open: !!open, actions: { trustAgent: !trusted, createRound: !!createRound },
+      roundParameters: { stakeEth: ethers.formatEther(stake), tolerance, duration, buffer } }, null, 2));
+    if (!process.argv.includes("--apply")) {
+      console.log("Read-only check complete. Add --apply to sign the listed owner actions.");
+      return;
+    }
+    if (!process.env.OWNER_PRIVATE_KEY) throw new Error("Set OWNER_PRIVATE_KEY locally to sign owner actions");
+    const signer = new ethers.NonceManager(new ethers.Wallet(process.env.OWNER_PRIVATE_KEY, provider));
+    if ((await signer.getAddress()).toLowerCase() !== owner.toLowerCase()) throw new Error("The signing wallet is not the contract owner");
+    const writer = contract.connect(signer);
+    if (!trusted) {
+      await writer.setTrustedAgent.staticCall(agent, true);
+      const transaction = await writer.setTrustedAgent(agent, true);
+      console.log("Trust evaluator transaction: " + transaction.hash);
+      await transaction.wait();
+    }
+    if (createRound) {
+      await writer.createRound.staticCall(stake, tolerance, duration, buffer);
+      const transaction = await writer.createRound(stake, tolerance, duration, buffer);
+      console.log("Create round transaction: " + transaction.hash);
+      await transaction.wait();
+    }
+    if (open) console.log("The current submission window is still open.");
+  } finally { provider.destroy(); }
 }
-
-main().catch((err) => {
-  console.error("Setup failed:", err.message);
-  process.exit(1);
-});
+main().catch((error) => { console.error(error.shortMessage || error.message); process.exitCode = 1; });
