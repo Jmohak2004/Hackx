@@ -1,157 +1,54 @@
 "use client";
 
-import {
-  createContext,
-  useContext,
-  useState,
-  useEffect,
-  useCallback,
-  type ReactNode,
-} from "react";
+import { createContext, useContext, type ReactNode } from "react";
+import { useAccount, useConnect, useConnectors, useDisconnect } from "wagmi";
 import { type Address } from "viem";
+import { SUPPORTED_CHAIN } from "@/lib/chain";
+import { readableError } from "@/lib/transactions";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// window.ethereum type
-// ─────────────────────────────────────────────────────────────────────────────
-
+// Retain this declaration for integrations which detect an injected provider.
 declare global {
   interface Window {
     ethereum?: {
       request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
-      on: (event: string, cb: (...args: unknown[]) => void) => void;
-      removeListener: (event: string, cb: (...args: unknown[]) => void) => void;
+      on: (event: string, callback: (...args: unknown[]) => void) => void;
+      removeListener: (event: string, callback: (...args: unknown[]) => void) => void;
       isMetaMask?: boolean;
     };
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONTEXT SHAPE
-// ─────────────────────────────────────────────────────────────────────────────
-
-interface WalletCtx {
+interface WalletState {
   address: Address | undefined;
+  chainId: number | undefined;
   isConnected: boolean;
   isConnecting: boolean;
+  error: string | null;
   connect: () => Promise<void>;
   disconnect: () => void;
 }
-
-const WalletContext = createContext<WalletCtx>({
-  address: undefined,
-  isConnected: false,
-  isConnecting: false,
-  connect: async () => {},
-  disconnect: () => {},
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-
-const SEPOLIA_HEX = "0xaa36a7";
-
-async function ensureSepolia() {
-  if (!window.ethereum) return;
-  try {
-    await window.ethereum.request({
-      method: "wallet_switchEthereumChain",
-      params: [{ chainId: SEPOLIA_HEX }],
-    });
-  } catch (err: unknown) {
-    // Chain not added — add it
-    if ((err as { code?: number }).code === 4902) {
-      await window.ethereum.request({
-        method: "wallet_addEthereumChain",
-        params: [
-          {
-            chainId: SEPOLIA_HEX,
-            chainName: "Sepolia Testnet",
-            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-            rpcUrls: [
-              process.env.NEXT_PUBLIC_RPC_URL ||
-                "https://ethereum-sepolia-rpc.publicnode.com",
-            ],
-            blockExplorerUrls: ["https://sepolia.etherscan.io"],
-          },
-        ],
-      });
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PROVIDER
-// ─────────────────────────────────────────────────────────────────────────────
+const WalletContext = createContext<WalletState | null>(null);
 
 export function WalletProvider({ children }: { children: ReactNode }) {
-  const [address, setAddress] = useState<Address | undefined>();
-  const [isConnecting, setIsConnecting] = useState(false);
-
-  // Passive reconnect — restore session without prompting
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.ethereum) return;
-
-    window.ethereum
-      .request({ method: "eth_accounts" })
-      .then((accounts) => {
-        const list = accounts as Address[];
-        if (list[0]) setAddress(list[0]);
-      })
-      .catch(() => {});
-
-    const onAccountsChanged = (accounts: unknown) => {
-      const list = accounts as Address[];
-      setAddress(list[0] ?? undefined);
-    };
-
-    window.ethereum.on("accountsChanged", onAccountsChanged);
-    return () =>
-      window.ethereum?.removeListener("accountsChanged", onAccountsChanged);
-  }, []);
-
-  const connect = useCallback(async () => {
-    if (typeof window === "undefined" || !window.ethereum) {
-      window.open("https://metamask.io/download/", "_blank");
-      return;
-    }
-    setIsConnecting(true);
-    try {
-      const accounts = (await window.ethereum.request({
-        method: "eth_requestAccounts",
-      })) as Address[];
-      if (accounts[0]) {
-        setAddress(accounts[0]);
-        await ensureSepolia();
-      }
-    } catch (e) {
-      console.error("Wallet connect error:", e);
-    } finally {
-      setIsConnecting(false);
-    }
-  }, []);
-
-  const disconnect = useCallback(() => setAddress(undefined), []);
-
-  return (
-    <WalletContext.Provider
-      value={{
-        address,
-        isConnected: !!address,
-        isConnecting,
-        connect,
-        disconnect,
-      }}
-    >
-      {children}
-    </WalletContext.Provider>
-  );
+  const account = useAccount();
+  const connectors = useConnectors();
+  const connection = useConnect();
+  const disconnection = useDisconnect();
+  async function connect() {
+    const connector = connectors.find((item) => item.type === "injected") || connectors[0];
+    if (!connector) throw new Error("Install an Ethereum wallet to continue");
+    await connection.mutateAsync({ connector, chainId: SUPPORTED_CHAIN.id });
+  }
+  return <WalletContext.Provider value={{
+    address: account.address, chainId: account.chainId,
+    isConnected: account.isConnected, isConnecting: connection.isPending,
+    error: connection.error ? readableError(connection.error) : null,
+    connect, disconnect: () => disconnection.mutate(),
+  }}>{children}</WalletContext.Provider>;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HOOK
-// ─────────────────────────────────────────────────────────────────────────────
-
 export function useWallet() {
-  return useContext(WalletContext);
+  const wallet = useContext(WalletContext);
+  if (!wallet) throw new Error("WalletProvider must wrap the page");
+  return wallet;
 }

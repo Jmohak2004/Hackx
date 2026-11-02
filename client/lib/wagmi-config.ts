@@ -1,22 +1,14 @@
 import { cookieStorage, createConfig, createStorage, http } from "wagmi";
-import { mainnet, sepolia } from "wagmi/chains";
 import { injected, metaMask } from "wagmi/connectors";
+import { SUPPORTED_CHAIN, RPC_URL } from "./chain";
 
 export const wagmiConfig = createConfig({
-  chains: [mainnet, sepolia],
+  chains: [SUPPORTED_CHAIN],
   connectors: [
+    injected({ shimDisconnect: true, unstable_shimAsyncInject: true }),
     metaMask(),
-    injected({
-      shimDisconnect: true,
-      unstable_shimAsyncInject: true,
-    }),
   ],
-  storage: createStorage({
-    storage: cookieStorage,
-  }),
-  transports: {
-    [mainnet.id]: http(),
-    [sepolia.id]: http(),
-  },
+  storage: createStorage({ storage: cookieStorage }),
+  transports: { 11155111: http(RPC_URL), 31337: http(RPC_URL) },
   ssr: true,
 });

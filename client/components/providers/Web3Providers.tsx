@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactNode, useState } from "react";
 import { type State, WagmiProvider } from "wagmi";
 import { wagmiConfig } from "@/lib/wagmi-config";
+import { WalletProvider } from "@/context/WalletContext";
 
 type Web3ProvidersProps = {
   children: ReactNode;
@@ -20,7 +21,9 @@ export function Web3Providers({ children, initialState }: Web3ProvidersProps) {
       initialState={initialState}
       reconnectOnMount
     >
-      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      <QueryClientProvider client={queryClient}>
+        <WalletProvider>{children}</WalletProvider>
+      </QueryClientProvider>
     </WagmiProvider>
   );
 }
