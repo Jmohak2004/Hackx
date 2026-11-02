@@ -39,7 +39,8 @@ export function StageHero() {
 
   if (!audioStarted) {
     return (
-      <div
+      <button
+        type="button"
         className="fixed inset-0 z-50 flex cursor-pointer flex-col items-center justify-center gap-6 bg-black"
         onClick={handleTap}
       >
@@ -51,7 +52,7 @@ export function StageHero() {
         <p className="text-sm font-medium tracking-widest text-amber-200/70 uppercase">
           Tap to Enter
         </p>
-      </div>
+      </button>
     );
   }
 
@@ -71,6 +72,10 @@ export function StageHero() {
         onEnded={handleEnded}
         onError={handleError}
       />
+      {!hasEnded && <button type="button" onClick={handleEnded}
+        className="absolute right-5 top-5 z-20 rounded-lg border border-amber-200/30 bg-black/60 px-4 py-2 text-sm text-amber-100">
+        Skip intro
+      </button>}
 
       <AnimatePresence>
         {hasEnded && (
@@ -131,6 +136,7 @@ export function StageHero() {
                   />
                 </Link>
               </motion.div>
+              <Link href="/arena" className="pointer-events-auto mt-4 text-sm text-amber-200 underline">Your entries</Link>
             </div>
           </>
         )}

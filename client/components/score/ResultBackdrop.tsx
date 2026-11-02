@@ -42,10 +42,10 @@ export function ResultBackdrop({
   return (
     <div className="fixed inset-0 z-0 overflow-hidden bg-black select-none">
       <div
-        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
+        className="absolute left-1/2 top-[35%] -translate-x-1/2 -translate-y-1/2 sm:top-1/2"
         style={{
-          width: `max(100vw, calc(100dvh * ${ASPECT}))`,
-          height: `max(100dvh, calc(100vw / ${ASPECT}))`,
+          width: `min(100vw, calc(100dvh * ${ASPECT}))`,
+          aspectRatio: String(ASPECT),
         }}
       >
         <Image
@@ -58,7 +58,8 @@ export function ResultBackdrop({
           sizes="100vw"
         />
 
-        <div
+        <output
+          aria-label="Judge score"
           className="absolute flex items-center justify-center font-bold tabular-nums tracking-tight text-black drop-shadow-[0_1px_0_rgba(255,255,255,0.35)]"
           style={{
             left: `${JUDGE_BOX.left}%`,
@@ -69,9 +70,10 @@ export function ResultBackdrop({
           }}
         >
           {formatScoreDisplay(judgeScore)}
-        </div>
+        </output>
 
-        <div
+        <output
+          aria-label="Your score"
           className="absolute flex items-center justify-center font-bold tabular-nums tracking-tight text-black drop-shadow-[0_1px_0_rgba(255,255,255,0.35)]"
           style={{
             left: `${YOUR_BOX.left}%`,
@@ -82,7 +84,7 @@ export function ResultBackdrop({
           }}
         >
           {formatScoreDisplay(yourScore)}
-        </div>
+        </output>
       </div>
     </div>
   );
