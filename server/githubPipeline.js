@@ -11,66 +11,22 @@
  *   or configure .env and run: node githubPipeline.js
  */
 
-require("dotenv").config();
+if (process.env.HACKX_GRAPH_WORKER !== "true") require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
-const { Octokit } = require("@octokit/rest");
+const { fetchGitHubData, resolveRepository, validateRepository } = require("./lib/github");
 const neo4j = require("neo4j-driver");
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID: uuidv4 } = require("node:crypto");
+const { githubUrl: normalizeGithubUrl, AppError } = require("./lib/errors");
+const { analyzeJavaScript, inferFunctionCalls } = require("./lib/call-graph");
 
 // ─────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const REPO_URL = process.env.REPO_URL || "https://github.com/octocat/Hello-World";
-const NEO4J_URI = process.env.NEO4J_URI || "bolt://localhost:7687";
+const NEO4J_URI = process.env.NEO4J_URI || "";
 const NEO4J_USER = process.env.NEO4J_USER || "neo4j";
-const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD || "password";
-const MAX_FILE_SIZE_BYTES = 300_000; // 300 KB per file
-
-// Files / dirs to skip entirely
-const IGNORED_PATHS = [
-  "node_modules",
-  "dist",
-  "build",
-  ".next",
-  "out",
-  "coverage",
-  ".cache",
-  "__pycache__",
-  ".git",
-  "vendor",
-  "target",
-];
-
-// Only process files with these extensions
-const SUPPORTED_EXTENSIONS = new Set([
-  "js", "jsx", "ts", "tsx", "mjs", "cjs",
-  "py", "java", "go", "rb", "php", "cs",
-  "cpp", "c", "h", "rs", "kt", "swift",
-]);
-
-// ─────────────────────────────────────────────
-// STEP 2 — GitHub Ingestion
-// ─────────────────────────────────────────────
-
-/**
- * Parses "https://github.com/owner/repo" → { owner, repo }
- */
-function parseRepoUrl(url) {
-  const match = url.match(/github\.com\/([^/]+)\/([^/]+)/);
-  if (!match) throw new Error(`Invalid GitHub URL: ${url}`);
-  return { owner: match[1], repo: match[2].replace(/\.git$/, "") };
-}
-
-/**
- * Returns true when a tree path should be skipped.
- */
-function shouldIgnorePath(filePath) {
-  const parts = filePath.split("/");
-  return parts.some((part) => IGNORED_PATHS.includes(part));
-}
-
+const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD || "";
 /**
  * Returns the lowercase extension of a file path, or "" if none.
  */
@@ -78,147 +34,6 @@ function getExtension(filePath) {
   const dot = filePath.lastIndexOf(".");
   if (dot === -1) return "";
   return filePath.slice(dot + 1).toLowerCase();
-}
-
-/**
- * Fetches everything we need from the GitHub API.
- * Returns a raw ingestion object.
- */
-async function fetchGitHubData(repoUrl) {
-  const { owner, repo } = parseRepoUrl(repoUrl);
-  console.log(`\n📡 [STEP 2] Fetching GitHub data for ${owner}/${repo}…`);
-
-  const octokit = new Octokit({
-    auth: GITHUB_TOKEN || undefined,
-    request: { timeout: 30_000 },
-  });
-
-  // 2a. Repo metadata
-  console.log("  ↳ Fetching repo metadata…");
-  const { data: metadata } = await octokit.repos.get({ owner, repo });
-
-  // 2b. Default branch (may not always be "main")
-  const defaultBranch = metadata.default_branch || "main";
-
-  // 2c. Full recursive file tree
-  console.log(`  ↳ Fetching file tree (branch: ${defaultBranch})…`);
-  let treeData;
-  try {
-    const { data } = await octokit.git.getTree({
-      owner,
-      repo,
-      tree_sha: defaultBranch,
-      recursive: "1",
-    });
-    treeData = data;
-  } catch (err) {
-    throw new Error(`Could not fetch file tree: ${err.message}`);
-  }
-
-  const allFiles = treeData.tree.filter((item) => item.type === "blob");
-  const filteredFiles = allFiles.filter((item) => {
-    if (shouldIgnorePath(item.path)) return false;
-    const ext = getExtension(item.path);
-    return SUPPORTED_EXTENSIONS.has(ext);
-  });
-
-  console.log(
-    `  ↳ ${allFiles.length} total blobs → ${filteredFiles.length} source files after filtering`
-  );
-
-  // 2d. File contents (skip oversized files)
-  console.log("  ↳ Fetching file contents…");
-  const fileContents = [];
-  for (const file of filteredFiles) {
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      console.log(`    ⚠ Skipping large file (${file.size} B): ${file.path}`);
-      continue;
-    }
-    try {
-      const { data } = await octokit.repos.getContent({
-        owner,
-        repo,
-        path: file.path,
-        ref: defaultBranch,
-      });
-      if (data.encoding === "base64" && data.content) {
-        const decoded = Buffer.from(data.content, "base64").toString("utf8");
-        fileContents.push({ path: file.path, content: decoded });
-      }
-    } catch (err) {
-      console.log(`    ⚠ Could not fetch ${file.path}: ${err.message}`);
-    }
-  }
-  console.log(`  ↳ Fetched content for ${fileContents.length} files`);
-
-  // 2e. README
-  console.log("  ↳ Fetching README…");
-  let readme = "";
-  try {
-    const { data } = await octokit.repos.getReadme({ owner, repo });
-    readme = Buffer.from(data.content, "base64").toString("utf8");
-  } catch {
-    console.log("    ⚠ No README found");
-  }
-
-  // 2f. Dependencies (package.json / requirements.txt)
-  console.log("  ↳ Fetching dependency files…");
-  const depFiles = ["package.json", "requirements.txt", "go.mod", "Gemfile", "build.gradle", "pom.xml"];
-  const dependencies = {};
-  for (const depFile of depFiles) {
-    try {
-      const { data } = await octokit.repos.getContent({
-        owner,
-        repo,
-        path: depFile,
-        ref: defaultBranch,
-      });
-      if (data.encoding === "base64") {
-        dependencies[depFile] = Buffer.from(data.content, "base64").toString("utf8");
-      }
-    } catch {
-      // file doesn't exist in this repo
-    }
-  }
-
-  // 2g. Recent commits (last 20)
-  console.log("  ↳ Fetching recent commits…");
-  const { data: commits } = await octokit.repos.listCommits({
-    owner,
-    repo,
-    per_page: 20,
-    sha: defaultBranch,
-  });
-  const recentCommits = commits.map((c) => ({
-    sha: c.sha,
-    message: c.commit.message,
-    author: c.commit.author?.name,
-    date: c.commit.author?.date,
-  }));
-
-  console.log("✅ [STEP 2] GitHub data fetched successfully\n");
-
-  return {
-    repoId: uuidv4(),
-    owner,
-    repo,
-    defaultBranch,
-    metadata: {
-      name: metadata.name,
-      description: metadata.description,
-      language: metadata.language,
-      stars: metadata.stargazers_count,
-      forks: metadata.forks_count,
-      size: metadata.size,
-      topics: metadata.topics,
-      createdAt: metadata.created_at,
-      updatedAt: metadata.updated_at,
-    },
-    fileContents,
-    readme,
-    dependencies,
-    recentCommits,
-  };
 }
 
 // ─────────────────────────────────────────────
@@ -238,6 +53,8 @@ const LANGUAGE_MAP = {
   rs: "rust",
   kt: "kotlin",
   swift: "swift",
+  sol: "solidity",
+  html: "html", css: "css", scss: "css", sass: "css",
 };
 
 /**
@@ -246,6 +63,10 @@ const LANGUAGE_MAP = {
  */
 function extractImports(content, language) {
   const imports = new Set();
+  if (language === "solidity" || language === "css") {
+    const statements = content.matchAll(/(?:import|@import)\s+(?:[^;\n]*?\sfrom\s+)?(?:url\()?["']([^"']+)["']/g);
+    for (const statement of statements) imports.add(statement[1]);
+  }
 
   if (language === "javascript" || language === "typescript") {
     // ES modules: import ... from '...'
@@ -259,7 +80,7 @@ function extractImports(content, language) {
   }
 
   if (language === "python") {
-    const pyImportRe = /^(?:import|from)\s+([\w.]+)/gm;
+    const pyImportRe = /^\s*(?:import|from)\s+([\w.]+)/gm;
     let m;
     while ((m = pyImportRe.exec(content)) !== null) imports.add(m[1]);
   }
@@ -290,6 +111,20 @@ function extractImports(content, language) {
  */
 function extractFunctions(content, language) {
   const functions = new Set();
+  if (language === "solidity" || language === "php") {
+    for (const match of content.matchAll(/\bfunction\s+(\w+)\s*\(/g)) functions.add(match[1]);
+  }
+  if (language === "swift") {
+    for (const match of content.matchAll(/\bfunc\s+(\w+)\s*[(<]/g)) functions.add(match[1]);
+  }
+  if (language === "ruby") {
+    for (const match of content.matchAll(/^\s*def\s+(?:self\.)?(\w+)/gm)) functions.add(match[1]);
+  }
+  if (language === "c" || language === "cpp") {
+    for (const match of content.matchAll(/^[\w\s*&:<>]+\s+(\w+)\s*\([^;{}]*\)\s*(?:const\s*)?\{/gm)) {
+      if (!["if", "while", "switch", "for"].includes(match[1])) functions.add(match[1]);
+    }
+  }
 
   if (language === "javascript" || language === "typescript") {
     const patterns = [
@@ -310,7 +145,7 @@ function extractFunctions(content, language) {
   }
 
   if (language === "python") {
-    const pyFnRe = /^(?:async\s+)?def\s+(\w+)\s*\(/gm;
+    const pyFnRe = /^\s*(?:async\s+)?def\s+(\w+)\s*\(/gm;
     let m;
     while ((m = pyFnRe.exec(content)) !== null) functions.add(m[1]);
   }
@@ -332,7 +167,7 @@ function extractFunctions(content, language) {
   }
 
   if (language === "rust") {
-    const rustFnRe = /^(?:pub\s+)?fn\s+(\w+)\s*[(<]/gm;
+    const rustFnRe = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*[(<]/gm;
     let m;
     while ((m = rustFnRe.exec(content)) !== null) functions.add(m[1]);
   }
@@ -345,7 +180,8 @@ function extractFunctions(content, language) {
  */
 function extractClasses(content, language) {
   const classes = new Set();
-  const classRe = /class\s+(\w+)/g;
+  const classRe = language === "solidity" ? /\b(?:contract|interface|library)\s+(\w+)/g
+    : language === "rust" || language === "swift" ? /\b(?:class|struct|enum)\s+(\w+)/g : /\bclass\s+(\w+)/g;
   let m;
   while ((m = classRe.exec(content)) !== null) classes.add(m[1]);
   return [...classes];
@@ -401,9 +237,10 @@ function preprocessCode(rawData) {
     const ext = getExtension(path);
     const language = LANGUAGE_MAP[ext] || "unknown";
 
-    const imports = extractImports(content, language);
-    const functions = extractFunctions(content, language);
-    const classes = extractClasses(content, language);
+    const analysis = ["javascript", "typescript"].includes(language) ? analyzeJavaScript(content, path) : null;
+    const imports = analysis?.imports || extractImports(content, language);
+    const functions = analysis?.functions || extractFunctions(content, language);
+    const classes = analysis?.classes || extractClasses(content, language);
     const apiEndpoints = extractApiEndpoints(content, language);
     const chunks = chunkContent(content);
 
@@ -417,6 +254,7 @@ function preprocessCode(rawData) {
       chunkCount: chunks.length,
       code: content,
       chunks,
+      ...(analysis || {}),
     };
 
     processedFiles.push(structured);
@@ -457,6 +295,7 @@ function preprocessCode(rawData) {
     repo: rawData.repo,
     metadata: rawData.metadata,
     processedFiles,
+    callEdges: inferFunctionCalls(processedFiles),
     topLevelDependencies: extractedDeps,
     recentCommits: rawData.recentCommits,
     readme: rawData.readme,
@@ -481,12 +320,16 @@ function esc(str) {
  * round-trips to Aura and avoid timeouts on large repos.
  */
 async function buildKnowledgeGraph(preprocessed) {
+  if (!NEO4J_URI) {
+    return { repoId: preprocessed.repoId, owner: preprocessed.owner, repo: preprocessed.repo, stats: {} };
+  }
   console.log("🧩 [STEP 4] Building Knowledge Graph in Neo4j…");
   console.log(`  ↳ Connecting to ${NEO4J_URI}…`);
 
   const driver = neo4j.driver(
     NEO4J_URI,
-    neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD)
+    neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD),
+    { connectionTimeout: 5000, maxConnectionPoolSize: 4, connectionAcquisitionTimeout: 5000 }
   );
 
   let session;
@@ -647,34 +490,10 @@ async function buildKnowledgeGraph(preprocessed) {
       endpointsCreated += file.apiEndpoints.length;
     }
 
-    // ── Cross-file CALLS edges (batched) ──────────────────────────────────
-    console.log("  ↳ Building cross-file CALLS edges…");
-    const functionRegistry = new Map(); // fnName → [fnId, ...]
-    for (const file of processedFiles) {
-      const fileId = `${repoId}:file:${file.file}`;
-      for (const fn of file.functions) {
-        if (!functionRegistry.has(fn)) functionRegistry.set(fn, []);
-        functionRegistry.get(fn).push(`${fileId}:fn:${fn}`);
-      }
-    }
-
-    const callsPairs = [];
-    for (const file of processedFiles) {
-      const fileId = `${repoId}:file:${file.file}`;
-      for (const callerFn of file.functions) {
-        const callerFnId = `${fileId}:fn:${callerFn}`;
-        for (const [calleeName, calleeIds] of functionRegistry) {
-          if (calleeName === callerFn) continue;
-          if (new RegExp(`\\b${calleeName}\\s*\\(`).test(file.code)) {
-            for (const calleeId of calleeIds) {
-              if (calleeId !== callerFnId) {
-                callsPairs.push({ callerId: callerFnId, calleeId });
-              }
-            }
-          }
-        }
-      }
-    }
+    const callsPairs = preprocessed.callEdges.map((edge) => ({
+      callerId: repoId + ":file:" + edge.callerFile + ":fn:" + edge.caller,
+      calleeId: repoId + ":file:" + edge.calleeFile + ":fn:" + edge.callee,
+    }));
 
     // Write CALLS in chunks of 500
     let callsEdges = 0;
@@ -771,30 +590,23 @@ function saveGraphCache(preprocessed, graphResult) {
     }
   }
 
-  // Heuristic CALLS edges
-  const fnRegistry = new Map();
-  for (const file of processedFiles) {
-    for (const fn of file.functions) {
-      if (!fnRegistry.has(fn)) fnRegistry.set(fn, []);
-      fnRegistry.get(fn).push({ id: `fn:${file.file}:${fn}`, file: file.file });
-    }
-  }
-  for (const file of processedFiles) {
-    for (const callerFn of file.functions) {
-      const callerId = `fn:${file.file}:${callerFn}`;
-      for (const [calleeName, callees] of fnRegistry) {
-        if (calleeName === callerFn) continue;
-        if (new RegExp(`\\b${calleeName}\\s*\\(`).test(file.code)) {
-          for (const callee of callees) {
-            if (callee.id !== callerId) {
-              edges.push({ source: callerId, target: callee.id, type: "CALLS" });
-            }
-          }
-        }
-      }
-    }
+  for (const edge of preprocessed.callEdges) {
+    edges.push({
+      source: "fn:" + edge.callerFile + ":" + edge.caller,
+      target: "fn:" + edge.calleeFile + ":" + edge.callee,
+      type: "CALLS",
+    });
   }
 
+  const stats = {
+    filesCreated: nodes.filter((node) => node.type === "File").length,
+    functionsCreated: nodes.filter((node) => node.type === "Function").length,
+    classesCreated: nodes.filter((node) => node.type === "Class").length,
+    importsCreated: edges.filter((edge) => edge.type === "IMPORTS").length,
+    endpointsCreated: nodes.filter((node) => node.type === "ApiEndpoint").length,
+    callsEdges: edges.filter((edge) => edge.type === "CALLS").length,
+  };
+  graphResult.stats = stats;
   const payload = {
     repoId,
     owner,
@@ -802,29 +614,40 @@ function saveGraphCache(preprocessed, graphResult) {
     githubUrl: `https://github.com/${owner}/${repo}`,
     metadata,
     fetchedAt,
-    stats: graphResult.stats,
+    stats,
     nodes,
     edges,
   };
 
   const filePath = path.join(CACHE_DIR, `${repoId}.json`);
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
+  const temporary = filePath + "." + uuidv4() + ".tmp";
+  fs.writeFileSync(temporary, JSON.stringify(payload, null, 2));
+  fs.renameSync(temporary, filePath);
   console.log(`  💾 Graph cache saved → graph-cache/${repoId}.json`);
   return filePath;
 }
 
+const summaryCache = new Map();
 function listCachedGraphs() {
   if (!fs.existsSync(CACHE_DIR)) return [];
-  return fs.readdirSync(CACHE_DIR)
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => {
-      const raw = fs.readFileSync(path.join(CACHE_DIR, f), "utf8");
-      const data = JSON.parse(raw);
-      return { repoId: data.repoId, owner: data.owner, repo: data.repo, fetchedAt: data.fetchedAt, stats: data.stats };
-    });
+  return fs.readdirSync(CACHE_DIR).filter((name) => name.endsWith(".json")).flatMap((name) => {
+    try {
+      const file = path.join(CACHE_DIR, name);
+      const modified = fs.statSync(file).mtimeMs;
+      const cached = summaryCache.get(name);
+      if (cached?.modified === modified) return [cached.summary];
+      const data = JSON.parse(fs.readFileSync(file, "utf8"));
+      const summary = { repoId: data.repoId, owner: data.owner, repo: data.repo, fetchedAt: data.fetchedAt, stats: data.stats };
+      summaryCache.set(name, { modified, summary });
+      return [summary];
+    } catch { return []; }
+  }).sort((a, b) => String(b.fetchedAt).localeCompare(String(a.fetchedAt)));
 }
 
 function loadCachedGraph(repoId) {
+  if (typeof repoId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(repoId)) {
+    throw new AppError(400, "INVALID_GRAPH_ID", "Invalid graph identifier");
+  }
   const filePath = path.join(CACHE_DIR, `${repoId}.json`);
   if (!fs.existsSync(filePath)) return null;
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -833,7 +656,7 @@ function loadCachedGraph(repoId) {
 // ─────────────────────────────────────────────
 // Main — orchestrate all steps
 // ─────────────────────────────────────────────
-async function runPipeline(repoUrl) {
+async function buildRepository(repoUrl) {
   console.log("═══════════════════════════════════════════");
   console.log("  🚀 Graphify Pipeline — Manual Run");
   console.log(`  🔗 Repo: ${repoUrl}`);
@@ -842,13 +665,28 @@ async function runPipeline(repoUrl) {
   const startTime = Date.now();
 
   // Step 2: Fetch
-  const rawData = await fetchGitHubData(repoUrl);
+  const snapshot = await resolveRepository(repoUrl);
+  const cached = loadCachedGraph(snapshot.repoId);
+  if (cached) return {
+    repoId: cached.repoId, owner: cached.owner, repo: cached.repo, stats: cached.stats, cached: true,
+  };
+  const rawData = await fetchGitHubData(repoUrl, { snapshot });
 
   // Step 3: Preprocess
   const preprocessed = preprocessCode(rawData);
+  const functionCount = preprocessed.processedFiles.reduce((count, file) => count + file.functions.length, 0);
+  if (functionCount > 2000) throw new AppError(422, "FUNCTION_LIMIT", "Repository exceeds the 2,000-function analysis limit");
 
   // Step 4: Graph
-  const result = await buildKnowledgeGraph(preprocessed);
+  let result;
+  try {
+    result = await buildKnowledgeGraph(preprocessed);
+  } catch (error) {
+    // Neo4j is an optional index. The deterministic JSON graph remains the
+    // authoritative input for scoring when the database is unavailable.
+    console.warn("Neo4j index unavailable; retaining the file graph.");
+    result = { repoId: preprocessed.repoId, owner: preprocessed.owner, repo: preprocessed.repo, stats: {} };
+  }
 
   // Save graph to disk cache
   saveGraphCache(preprocessed, result);
@@ -859,6 +697,15 @@ async function runPipeline(repoUrl) {
   console.log("═══════════════════════════════════════════\n");
 
   return result;
+}
+
+const running = new Map();
+function runPipeline(value) {
+  const url = normalizeGithubUrl(value);
+  if (running.has(url)) return running.get(url);
+  const task = buildRepository(url).finally(() => running.delete(url));
+  running.set(url, task);
+  return task;
 }
 
 // ─────────────────────────────────────────────
@@ -872,4 +719,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runPipeline, fetchGitHubData, preprocessCode, buildKnowledgeGraph, saveGraphCache, listCachedGraphs, loadCachedGraph };
+module.exports = { validateRepository, runPipeline, fetchGitHubData, preprocessCode, buildKnowledgeGraph, saveGraphCache, listCachedGraphs, loadCachedGraph };
