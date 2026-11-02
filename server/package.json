@@ -6,9 +6,11 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
+    "test": "node --test test/*.test.js",
     "pipeline": "node githubPipeline.js"
   },
   "dependencies": {
+    "@babel/parser": "7.29.12",
     "@octokit/rest": "^20.1.1",
     "axios": "^1.6.8",
     "cors": "^2.8.5",
@@ -16,10 +18,14 @@
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
     "express": "^4.19.2",
+    "lighthouse": "13.6.0",
     "neo4j-driver": "^5.19.0",
-    "uuid": "^9.0.1"
+    "tar-stream": "3.2.2"
   },
   "overrides": {
     "qs": "6.16.2"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }
