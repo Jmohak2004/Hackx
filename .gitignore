@@ -17,6 +17,7 @@ env/
 .env
 .env.example
 .env.*
+!.env.example
 .venv/
 venv/
 
@@ -32,7 +33,12 @@ venv/
 
 # Node
 node_modules/
-package-lock.json
+artifacts/
+cache/
+coverage/
+deployments/31337.json
+server/data/
+.local/
 
 # Next.js
 .next/
