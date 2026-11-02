@@ -1,0 +1,35 @@
+name: Verify HackX
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            client/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: server/computer-use/requirements.lock.txt
+      - run: npm ci
+      - run: npm ci --prefix server
+      - run: npm ci --prefix client
+      - run: pip install -r server/computer-use/requirements.lock.txt
+      - run: npm run contracts:compile
+      - run: npm run contracts:export
+      - run: git diff --exit-code -- server/game-artifact.json client/lib/game-abi.ts
+      - run: npm run contracts:test
+      - run: npm test --prefix server
+      - run: python -m unittest discover -s tests -v
+        working-directory: server/computer-use
+      - run: npm run lint --prefix client
+      - run: npm run build --prefix client
