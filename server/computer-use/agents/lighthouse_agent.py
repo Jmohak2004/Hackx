@@ -1,17 +1,16 @@
-"""
-Lighthouse agent — runs a Lighthouse audit against a live URL
-and extracts the core category scores.
-
-Requires Node.js and `lighthouse` npm package to be installed globally
-or available via npx.
-"""
-
+"""Run the repository's pinned Lighthouse CLI using Playwright's Chromium."""
 import asyncio
 import json
+import math
+import os
 import shutil
+import signal
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from playwright.async_api import async_playwright
+from url_security import ensure_public_url
 
 
 @dataclass
@@ -31,69 +30,69 @@ class LighthouseResult:
 
 
 async def run_lighthouse(url: str) -> LighthouseResult:
-    """
-    Run a Lighthouse audit on *url* and return category scores (0-100 scale).
-    Falls back gracefully if lighthouse / npx is not available.
-    """
     result = LighthouseResult(url=url)
-
-    # Check if npx is available
-    npx = shutil.which("npx")
-    if npx is None:
-        result.error = "npx not found on PATH — cannot run Lighthouse"
+    node = shutil.which("node")
+    cli = Path(__file__).resolve().parents[2] / "node_modules/lighthouse/cli/index.js"
+    if not node or not cli.exists():
+        result.error = "Install the Node server dependencies to enable Lighthouse"
         return result
-
-    tmp_dir = tempfile.mkdtemp(prefix="lh_")
-    output_path = Path(tmp_dir) / "report.json"
-
-    cmd = [
-        npx, "--yes", "lighthouse", url,
-        "--output=json",
-        f"--output-path={output_path}",
-        "--chrome-flags=--headless --no-sandbox --disable-gpu",
-        "--quiet",
-    ]
-
+    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-
-        if proc.returncode != 0:
-            result.error = f"Lighthouse exited with code {proc.returncode}: {stderr.decode()[:500]}"
-            return result
-
-        if not output_path.exists():
-            result.error = "Lighthouse did not produce a report file"
-            return result
-
-        with open(output_path, "r") as f:
-            report = json.load(f)
-
-        categories = report.get("categories", {})
-        result.scores = LighthouseScores(
-            performance=_cat_score(categories, "performance"),
-            accessibility=_cat_score(categories, "accessibility"),
-            best_practices=_cat_score(categories, "best-practices"),
-            seo=_cat_score(categories, "seo"),
-        )
-        result.raw_json_path = str(output_path)
-
+        target = await ensure_public_url(url)
+        async with async_playwright() as playwright:
+            chrome = os.getenv("CHROME_PATH") or playwright.chromium.executable_path
+        if not Path(chrome).exists():
+            raise ValueError("Chromium is missing. Run python -m playwright install chromium")
+        with tempfile.TemporaryDirectory(prefix="hackx-lighthouse-") as directory:
+            output = Path(directory) / "report.json"
+            flags = "--headless --disable-gpu"
+            if os.getenv("CHROME_NO_SANDBOX") == "true":
+                flags += " --no-sandbox"
+            proc = await asyncio.create_subprocess_exec(
+                node, str(cli), target, "--output=json", f"--output-path={output}",
+                f"--chrome-flags={flags}",
+                "--only-categories=performance,accessibility,best-practices,seo",
+                "--max-wait-for-load=45000", "--quiet",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "CHROME_PATH": chrome},
+                start_new_session=os.name != "nt",
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=150)
+            if proc.returncode != 0:
+                raise ValueError("Lighthouse failed: " + stderr.decode(errors="replace")[-500:])
+            if not output.exists():
+                raise ValueError("Lighthouse did not produce a report")
+            report = json.loads(output.read_text())
+            if report.get("runtimeError"):
+                raise ValueError("Lighthouse audit failed: " + report["runtimeError"].get("message", "unknown error"))
+            categories = report.get("categories", {})
+            result.scores = LighthouseScores(
+                performance=_cat_score(categories, "performance"),
+                accessibility=_cat_score(categories, "accessibility"),
+                best_practices=_cat_score(categories, "best-practices"),
+                seo=_cat_score(categories, "seo"),
+            )
+    except asyncio.CancelledError:
+        raise
     except asyncio.TimeoutError:
-        result.error = "Lighthouse timed out after 120 seconds"
+        result.error = "Lighthouse timed out before a valid score was available"
     except Exception as exc:
         result.error = str(exc)
-
+    finally:
+        if proc and proc.returncode is None:
+            try:
+                if os.name != "nt":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
     return result
 
 
 def _cat_score(categories: dict, key: str) -> float:
-    """Extract a category score and convert from 0-1 to 0-100 scale."""
-    cat = categories.get(key, {})
-    score = cat.get("score")
-    if score is None:
-        return 0.0
-    return round(float(score) * 100, 1)
+    value = categories.get(key, {}).get("score")
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"Lighthouse category {key} did not produce a valid score")
+    return round(value * 100, 1)
