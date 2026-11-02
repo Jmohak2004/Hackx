@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import * as d3 from "d3";
+import { API_BASE } from "@/lib/api";
+import Link from "next/link";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface GraphNode extends d3.SimulationNodeDatum {
@@ -38,8 +40,6 @@ interface CachedGraph {
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const API_BASE = process.env.NEXT_PUBLIC_SERVER_URL ?? "http://localhost:4000";
-
 const NODE_COLORS: Record<string, string> = {
   Repo:        "#f97316",
   File:        "#3b82f6",
@@ -89,13 +89,16 @@ export default function GraphPage() {
 
   // ── Fetch list of cached graphs
   useEffect(() => {
-    fetch(`${API_BASE}/api/graphs`)
-      .then((r) => r.json())
+    const controller = new AbortController();
+    fetch(`${API_BASE}/api/graphs`, { signal: controller.signal })
+      .then((r) => { if (!r.ok) throw new Error("Graphs unavailable"); return r.json(); })
       .then((d) => {
         setGraphs(d.graphs || []);
-        if (d.graphs?.length > 0) setSelectedId(d.graphs[0].repoId);
+        const requested = new URLSearchParams(window.location.search).get("repoId");
+        if (d.graphs?.length > 0) setSelectedId(d.graphs.find((g: CachedGraph) => g.repoId === requested)?.repoId || d.graphs[0].repoId);
       })
-      .catch(() => setError("Cannot reach API server. Make sure it's running on port 4000."));
+      .catch(() => { if (!controller.signal.aborted) setError("Repository graphs are temporarily unavailable. Please reload to retry."); });
+    return () => controller.abort();
   }, []);
 
   // ── Load graph when selection changes
@@ -105,10 +108,12 @@ export default function GraphPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
     setError("");
-    fetch(`${API_BASE}/api/graph/${selectedId}`)
-      .then((r) => r.json())
+    const controller = new AbortController();
+    fetch(`${API_BASE}/api/graph/${encodeURIComponent(selectedId)}`, { signal: controller.signal })
+      .then((r) => { if (!r.ok) throw new Error("Graph unavailable"); return r.json(); })
       .then((d) => { setGraphData(d); setLoading(false); })
-      .catch(() => { setError("Failed to load graph data."); setLoading(false); });
+      .catch(() => { if (!controller.signal.aborted) { setError("Failed to load graph data. Please reload to retry."); setLoading(false); } });
+    return () => controller.abort();
   }, [selectedId]);
 
   // ── D3 force simulation
@@ -268,10 +273,10 @@ export default function GraphPage() {
       svgEl.transition().duration(500).call(zoom.transform, d3.zoomIdentity.translate(width / 2, height / 2).scale(0.6));
     };
 
-    return () => simulation.stop();
+    return () => { simulation.stop(); };
   }, [graphData, search, activeTypes, nodeLimit]);
 
-  useEffect(() => { renderGraph(); }, [renderGraph]);
+  useEffect(() => renderGraph(), [renderGraph]);
 
   // ── Resize handler
   useEffect(() => {
@@ -294,10 +299,10 @@ export default function GraphPage() {
   };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden" style={{ background: "#0d0d14", fontFamily: "'JetBrains Mono', monospace" }}>
+    <div className="flex h-dvh w-full flex-col overflow-hidden md:flex-row" style={{ background: "#0d0d14", fontFamily: "'JetBrains Mono', monospace" }}>
 
       {/* ── Sidebar */}
-      <aside className="flex flex-col gap-4 w-64 shrink-0 border-r overflow-y-auto p-4"
+      <aside className="flex max-h-[38dvh] w-full shrink-0 flex-col gap-4 overflow-y-auto border-r p-4 md:max-h-none md:w-64"
         style={{ borderColor: "#1e1e2e", background: "#0a0a12" }}>
 
         {/* Header */}
@@ -324,13 +329,14 @@ export default function GraphPage() {
 
         {/* Repo selector */}
         <div>
-          <label className="text-xs font-semibold mb-1 block" style={{ color: "#4a4a6a" }}>REPOSITORY</label>
+          <label htmlFor="graph-repository" className="text-xs font-semibold mb-1 block" style={{ color: "#4a4a6a" }}>REPOSITORY</label>
           {graphs.length === 0 ? (
             <div className="text-xs p-2 rounded" style={{ background: "#1e1e2e", color: "#ef4444" }}>
               No cached graphs. Run the pipeline first.
             </div>
           ) : (
             <select
+              id="graph-repository"
               value={selectedId}
               onChange={(e) => setSelectedId(e.target.value)}
               className="w-full text-xs p-2 rounded outline-none"
@@ -429,7 +435,7 @@ export default function GraphPage() {
       </aside>
 
       {/* ── Main canvas */}
-      <main className="flex-1 flex flex-col relative">
+      <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
 
         {/* Top bar */}
         <header className="flex items-center justify-between px-5 py-3 shrink-0 border-b"
@@ -445,6 +451,7 @@ export default function GraphPage() {
             )}
           </div>
           <div className="flex items-center gap-3">
+            <Link href="/arena" className="text-xs text-amber-200 underline">Arena</Link>
             {graphData && (
               <a href={graphData.githubUrl} target="_blank" rel="noreferrer"
                 className="text-xs px-3 py-1.5 rounded transition-all hover:opacity-80"
@@ -472,9 +479,6 @@ export default function GraphPage() {
               <div className="text-center p-8 rounded-xl" style={{ background: "#1e1e2e", border: "1px solid #ef444440" }}>
                 <div className="text-2xl mb-2">⚠</div>
                 <div className="text-sm" style={{ color: "#ef4444" }}>{error}</div>
-                <div className="text-xs mt-2" style={{ color: "#4a4a6a" }}>
-                  Start the server: <code className="px-1 rounded" style={{ background: "#0d0d14" }}>node index.js</code> in <code>/server</code>
-                </div>
               </div>
             </div>
           )}
@@ -484,11 +488,9 @@ export default function GraphPage() {
                 <div className="text-3xl mb-3">🧩</div>
                 <div className="text-white font-bold mb-2">No Graphs Yet</div>
                 <div className="text-xs" style={{ color: "#4a4a6a" }}>
-                  Run the pipeline to generate a knowledge graph:
+                  Submit a repository for evaluation to explore its code graph.
                 </div>
-                <code className="block mt-3 p-3 rounded text-xs text-left" style={{ background: "#0d0d14", color: "#f97316" }}>
-                  node githubPipeline.js
-                </code>
+                <Link href="/auth" className="mt-3 block text-sm text-amber-200 underline">Submit a project</Link>
               </div>
             </div>
           )}
