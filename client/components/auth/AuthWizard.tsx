@@ -5,118 +5,50 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useConnect, useConnectors, useAccount } from "wagmi";
-import {
-  createPublicClient,
-  createWalletClient,
-  custom,
-  http,
-  fallback,
-  parseEventLogs,
-  type Address,
-} from "viem";
-import { sepolia } from "viem/chains";
+import { useQuery } from "@tanstack/react-query";
+import { parseEventLogs, type Address } from "viem";
 import { GAME_ABI, GAME_CONTRACT_ADDRESS } from "@/lib/contract";
+import { publicClient as viemPublicClient, SUPPORTED_CHAIN } from "@/lib/chain";
+import { sendGameTransaction } from "@/lib/transactions";
+import { api, watchEvaluation, type Readiness, type RoundInfo } from "@/lib/api";
+import { saveSubmission } from "@/lib/submissions";
 import { runWelcomeConfetti } from "./celebrate";
 
 // ──────────────────────────────────────────────────────────────────────────��──
 // BLOCKCHAIN HELPERS
 // ───────────────────────────────────────────────────────────────────────────���─
 
-const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
-
-const rpcUrl = process.env.NEXT_PUBLIC_RPC_URL;
-
-const viemPublicClient = createPublicClient({
-  chain: sepolia,
-  transport: rpcUrl
-    ? http(rpcUrl)
-    : fallback([
-        http("https://ethereum-sepolia-rpc.publicnode.com"),
-        http("https://sepolia.drpc.org"),
-      ]),
-});
-
-const SERVER_API_BASE =
-  process.env.NEXT_PUBLIC_SERVER_URL ?? "http://localhost:4000";
-
-async function ensureWalletOnSepolia() {
-  if (typeof window === "undefined" || !window.ethereum) return;
-  const currentChainId = (await window.ethereum.request({
-    method: "eth_chainId",
-  })) as string;
-  if (currentChainId?.toLowerCase() === SEPOLIA_CHAIN_ID_HEX) return;
-  try {
-    await window.ethereum.request({
-      method: "wallet_switchEthereumChain",
-      params: [{ chainId: SEPOLIA_CHAIN_ID_HEX }],
-    });
-  } catch (err: unknown) {
-    if ((err as { code?: number }).code === 4902) {
-      await window.ethereum.request({
-        method: "wallet_addEthereumChain",
-        params: [
-          {
-            chainId: SEPOLIA_CHAIN_ID_HEX,
-            chainName: "Sepolia Testnet",
-            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-            rpcUrls: [rpcUrl || "https://ethereum-sepolia-rpc.publicnode.com"],
-            blockExplorerUrls: ["https://sepolia.etherscan.io"],
-          },
-        ],
-      });
-    } else {
-      throw err;
-    }
-  }
-}
-
-/**
- * Call enterGame on the contract, staking ETH.
- * Returns the entryId from the EntrySubmitted event.
- */
 async function stakeAndEnterGame(
   walletAddress: Address,
   selfScore: number,
   githubUrl: string,
   websiteUrl: string,
-  stakeAmountWei: bigint
+  stakeAmountWei: bigint,
+  roundId: bigint,
 ): Promise<{ entryId: bigint; txHash: string }> {
-  await ensureWalletOnSepolia();
-
-  const walletClient = createWalletClient({
-    account: walletAddress,
-    chain: sepolia,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    transport: custom(window.ethereum as any),
-  });
-
-  // selfScore is 1-10 from UI, contract expects 0-100
-  const contractScore = BigInt(selfScore * 10);
-
-  const hash = await walletClient.writeContract({
-    address: GAME_CONTRACT_ADDRESS,
-    abi: GAME_ABI,
-    functionName: "enterGame",
-    args: [contractScore, githubUrl, websiteUrl],
-    value: stakeAmountWei,
-  });
-
-  const receipt = await viemPublicClient.waitForTransactionReceipt({ hash });
-
-  // Parse EntrySubmitted event to get entryId
+  const submission = {
+    account: walletAddress, roundId: roundId.toString(), githubUrl,
+    hostedUrl: websiteUrl, selfScore, createdAt: Date.now(),
+  };
+  const { hash, receipt } = await sendGameTransaction(
+    "enterGame", [BigInt(selfScore * 10), githubUrl, websiteUrl], {
+      value: stakeAmountWei,
+      expectedAccount: walletAddress,
+      onSubmitted: (txHash) => { saveSubmission({ ...submission, txHash, status: "pending" }); },
+    },
+  );
   const logs = parseEventLogs({
-    abi: GAME_ABI,
-    logs: receipt.logs,
-    eventName: "EntrySubmitted",
+    abi: GAME_ABI, eventName: "EntrySubmitted",
+    logs: receipt.logs.filter((log) => log.address.toLowerCase() === GAME_CONTRACT_ADDRESS.toLowerCase()),
   });
-
-  if (logs.length === 0) {
-    throw new Error("EntrySubmitted event not found in transaction receipt");
-  }
-
-  const entryId = (logs[0] as { args: { entryId: bigint } }).args.entryId;
-
-  return { entryId, txHash: hash };
+  const event = logs.find((log) => log.args.participant?.toLowerCase() === walletAddress.toLowerCase());
+  if (!event?.args.entryId) throw new Error("The confirmed transaction did not contain your entry");
+  saveSubmission({
+    ...submission, txHash: hash, entryId: event.args.entryId.toString(),
+    roundId: event.args.roundId.toString(),
+    status: "confirmed",
+  });
+  return { entryId: event.args.entryId, txHash: hash };
 }
 
 /** Three sequential plays (left panel). Uses one file three times until load_2.mp4 / load_3.mp4 exist in public/images. */
@@ -162,6 +94,7 @@ function isValidGithubUrl(raw: string): boolean {
     const u = new URL(raw.trim());
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
     if (u.hostname.toLowerCase() !== "github.com") return false;
+    if (u.username || u.password || u.port || u.search || u.hash) return false;
     const parts = u.pathname.split("/").filter(Boolean);
     return parts.length === 2 && parts.every((part) => part !== "." && part !== "..");
   } catch {
@@ -185,15 +118,11 @@ type PhaseStatus = "pending" | "active" | "done" | "error";
 function ProcessingLoader({
   githubUrl,
   hostedUrl,
-  selfScore,
   entryId,
-  roundId,
 }: {
   githubUrl: string;
   hostedUrl: string;
-  selfScore: number;
   entryId: bigint | null;
-  roundId: bigint | null;
 }) {
   const router = useRouter();
   const [clipIndex, setClipIndex] = useState(0);
@@ -203,7 +132,6 @@ function ProcessingLoader({
   ]);
   const [logs, setLogs] = useState<string[]>([]);
   const [apiError, setApiError] = useState<string | null>(null);
-  const hasCalled = useRef(false);
   const [retryCount, setRetryCount] = useState(0);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -216,87 +144,34 @@ function ProcessingLoader({
   }, [logs]);
 
   useEffect(() => {
-    if (hasCalled.current) return;
-    hasCalled.current = true;
-
-    async function runPipeline() {
-      pushLog(`[UI] Starting entry evaluation through ${SERVER_API_BASE}`);
-      if (entryId) pushLog(`[Chain] Reading on-chain entry ${entryId.toString()}`);
-
-      setPhaseStatuses(["active", "pending", "pending"]);
-
-      try {
-        // The server reads the committed links and self-score from Sepolia,
-        // evaluates those values, and submits that result with its trusted key.
-        const resp = await fetch(`${SERVER_API_BASE}/api/blockchain/evaluate-entry`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ entryId: entryId?.toString() }),
-        });
-
-        setPhaseStatuses(["done", "active", "pending"]);
-        pushLog(`[UI] API responded with status ${resp.status}`);
-
-        if (!resp.ok) {
-          const errText = await resp.text();
-          throw new Error(`API error ${resp.status}: ${errText.slice(0, 300)}`);
+    if (!entryId) return;
+    const controller = new AbortController();
+    watchEvaluation(entryId.toString(), {
+      signal: controller.signal,
+      retry: retryCount > 0,
+      onJob: (job) => {
+        setLogs(job.logs || []);
+        if (job.status === "queued" || job.status === "validating") {
+          setPhaseStatuses(["active", "pending", "pending"]);
+        } else if (job.status === "evaluating") {
+          setPhaseStatuses(["done", "active", "pending"]);
+        } else if (job.status === "succeeded") {
+          setPhaseStatuses(["done", "done", "done"]);
+        } else {
+          setPhaseStatuses(["done", "done", "active"]);
         }
-
-        const data = await resp.json();
-
-        // Stream logs from API response into the UI console
-        if (Array.isArray(data.logs)) {
-          for (const line of data.logs as string[]) {
-            pushLog(line);
-          }
-        }
-        if (Array.isArray(data.errors) && data.errors.length > 0) {
-          for (const e of data.errors as string[]) {
-            pushLog(`[WARN] ${e}`);
-          }
-        }
-
-        setPhaseStatuses(["done", "done", "active"]);
-        pushLog(`[UI] Scores received — user=${data.user_score} ai=${data.ai_score} github=${data.github_score} avg=${data.avg_score}`);
-
-        const chainResult = data.chain ?? {};
-        if (chainResult.scoreTxHash) {
-          pushLog(`[Chain] Score verified on-chain! tx=${chainResult.scoreTxHash}`);
-          pushLog(`[Chain] Winner: ${chainResult.isWinnerOnChain ? "YES" : "NO"}`);
-        }
-
-        pushLog(`[UI] user_wins=${data.user_wins}  Redirecting to results page…`);
-
-        await new Promise((r) => setTimeout(r, 800));
-        setPhaseStatuses(["done", "done", "done"]);
-
-        // Merge blockchain data into score result
-        const enrichedData = {
-          ...data,
-          chain: {
-            ...chainResult,
-            entryId: entryId?.toString() ?? null,
-            roundId: roundId?.toString() ?? null,
-          },
-        };
-
-        // Navigate to /score with result encoded
-        const params = new URLSearchParams({
-          d: encodeURIComponent(JSON.stringify(enrichedData)),
-        });
-        router.push(`/score?${params.toString()}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        pushLog(`[ERROR] ${msg}`);
-        setApiError(msg);
-        setPhaseStatuses((prev) =>
-          prev.map((s) => (s === "active" ? "error" : s))
-        );
-      }
-    }
-
-    runPipeline();
-  }, [githubUrl, hostedUrl, selfScore, entryId, roundId, pushLog, router, retryCount]);
+      },
+    }).then(() => {
+      if (!controller.signal.aborted) router.replace("/score?entryId=" + entryId.toString());
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      const message = error instanceof Error ? error.message : "Evaluation failed";
+      pushLog("[ERROR] " + message);
+      setApiError(message);
+      setPhaseStatuses((previous) => previous.map((status) => status === "active" ? "error" : status));
+    });
+    return () => controller.abort();
+  }, [entryId, pushLog, retryCount, router]);
 
   const handleEnded = useCallback(() => {
     if (clipIndex < LOADER_CLIPS.length - 1) setClipIndex(clipIndex + 1);
@@ -394,7 +269,6 @@ function ProcessingLoader({
               type="button"
               className="mt-3 rounded-lg border border-red-300/30 px-3 py-1.5 text-xs font-medium text-red-100 transition-colors hover:bg-red-400/10"
               onClick={() => {
-                hasCalled.current = false;
                 setApiError(null);
                 setRetryCount((count) => count + 1);
               }}
@@ -457,7 +331,6 @@ export function AuthWizard() {
   const [isStaking, setIsStaking] = useState(false);
   const [stakeError, setStakeError] = useState("");
   const [entryId, setEntryId] = useState<bigint | null>(null);
-  const [currentRoundId, setCurrentRoundId] = useState<bigint | null>(null);
 
   const { address, isConnected, status } = useAccount();
   const connectors = useConnectors();
@@ -469,6 +342,13 @@ export function AuthWizard() {
   } = useConnect();
 
   const visibleStep = step === 3 && isConnected && !!address ? 4 : step;
+  const currentRound = useQuery({
+    queryKey: ["submission-round", GAME_CONTRACT_ADDRESS],
+    queryFn: () => api<{ round: RoundInfo | null }>("/api/blockchain/round"),
+    enabled: visibleStep >= 3,
+    refetchInterval: 10_000,
+    retry: 1,
+  });
 
   useEffect(() => {
     if (visibleStep !== 4) return;
@@ -522,7 +402,7 @@ export function AuthWizard() {
    * Stake ETH and enter the game on-chain, then advance to analysis.
    */
   async function handleAnalyzeClick() {
-    if (!address || !window.ethereum) {
+    if (!address) {
       setStakeError("Wallet not connected. Please go back and connect.");
       return;
     }
@@ -531,6 +411,16 @@ export function AuthWizard() {
     setStakeError("");
 
     try {
+      const readiness = await api<Readiness>("/ready");
+      if (readiness.chain.chainId !== SUPPORTED_CHAIN.id ||
+          readiness.chain.contractAddress.toLowerCase() !== GAME_CONTRACT_ADDRESS.toLowerCase()) {
+        throw new Error("The website and evaluation service are configured for different contracts");
+      }
+      const normalized = await api<{ githubUrl: string; hostedUrl: string }>("/api/validate", {
+        method: "POST", body: JSON.stringify({ githubUrl, hostedUrl }),
+      });
+      setGithubUrl(normalized.githubUrl);
+      setHostedUrl(normalized.hostedUrl);
       // Read current round from the contract
       const roundIdRaw = await viemPublicClient.readContract({
         address: GAME_CONTRACT_ADDRESS,
@@ -558,14 +448,12 @@ export function AuthWizard() {
         return;
       }
 
-      const now = BigInt(Math.floor(Date.now() / 1000));
-      if (now > roundData.endTime) {
+      const now = (await viemPublicClient.getBlock()).timestamp;
+      if (now >= roundData.endTime) {
         setStakeError("Submission period has ended for this round.");
         setIsStaking(false);
         return;
       }
-
-      setCurrentRoundId(roundId);
 
       const selfScore = Number(score.trim()) || 1;
       const stakeWei = roundData.stakeAmount;
@@ -573,9 +461,10 @@ export function AuthWizard() {
       const { entryId: newEntryId } = await stakeAndEnterGame(
         address,
         selfScore,
-        githubUrl.trim(),
-        hostedUrl.trim() || githubUrl.trim(), // websiteUrl required by contract
-        stakeWei
+        normalized.githubUrl,
+        normalized.hostedUrl,
+        stakeWei,
+        roundId,
       );
 
       setEntryId(newEntryId);
@@ -628,9 +517,7 @@ export function AuthWizard() {
         <ProcessingLoader
           githubUrl={githubUrl}
           hostedUrl={hostedUrl}
-          selfScore={Number(score.trim()) || 1}
           entryId={entryId}
-          roundId={currentRoundId}
         />
       ) : visibleStep === 4 ? (
         <div className="relative z-20 flex min-h-dvh flex-col">
@@ -652,7 +539,7 @@ export function AuthWizard() {
             </p>
             <button
               type="button"
-              disabled={isStaking}
+              disabled={isStaking || !currentRound.data?.round?.isOpen}
               onClick={handleAnalyzeClick}
               className={`${btnPrimaryClass} mt-10 w-full max-w-sm`}
             >
@@ -666,8 +553,12 @@ export function AuthWizard() {
             <p className="mt-4 max-w-sm text-xs text-amber-100/50">
               {isStaking
                 ? "Confirm the transaction in your wallet to stake ETH and enter the game."
-                : "Next we\u2019ll stake your entry and process your GitHub and hosted links."}
+                : currentRound.data?.round?.isOpen
+                  ? "Entry stake: " + currentRound.data.round.stakeAmountEth + " ETH · Round #" + currentRound.data.round.id
+                  : currentRound.isError ? "Unable to reach the contest API. Reconnect before staking."
+                    : currentRound.isPending ? "Checking the current round…" : "Submissions are closed. Check Arena for your existing entries."}
             </p>
+            <Link href="/arena" className="mt-4 text-xs text-amber-100/70 underline underline-offset-4">Open your entries</Link>
           </div>
         </div>
       ) : (
@@ -683,7 +574,9 @@ export function AuthWizard() {
               <p className="justify-self-center text-center text-[0.65rem] font-semibold uppercase tracking-[0.28em] text-amber-200/75 [font-family:var(--font-heading)] sm:text-xs sm:tracking-[0.32em]">
                 Register
               </p>
-              <span className="justify-self-end" aria-hidden />
+              <Link href="/arena" className="justify-self-end text-xs text-amber-100/75 underline underline-offset-4">
+                Your entries
+              </Link>
             </div>
           </header>
 
@@ -786,7 +679,7 @@ export function AuthWizard() {
                         value={githubUrl}
                         onChange={(e) => setGithubUrl(e.target.value)}
                         className={inputClass}
-                        placeholder="https://github.com/your-username"
+                        placeholder="https://github.com/your-username/project"
                       />
                     </label>
 
