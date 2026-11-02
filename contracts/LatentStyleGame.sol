@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -7,387 +7,384 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
  * @title LatentStyleGame
- * @notice Trustless AI-verified skill contest: stake ETH, self-declare a score,
- *         submit proof links, and let an off-chain AI agent verify. Winners claim prizes.
+ * @notice Stake ETH against a self-score and let a trusted evaluator judge it.
+ * @dev Version 2 freezes settlement before the first payout. Unjudged stakes are
+ *      reserved in full and never enter the prize pool or platform fee.
  */
 contract LatentStyleGame is ReentrancyGuard, Ownable, Pausable {
+    uint256 public constant VERSION = 2;
+    uint256 public constant PLATFORM_FEE_BPS = 500;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant MAX_SCORE = 100;
+    uint256 public constant MIN_STAKE = 0.001 ether;
+    uint256 public constant MAX_STAKE = 10 ether;
+    uint256 public constant MAX_URL_BYTES = 2048;
+    uint256 public constant MAX_PROOF_BYTES = 256;
+    uint256 public constant MAX_PAGE_SIZE = 100;
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // CONSTANTS & CONFIG
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    uint256 public constant PLATFORM_FEE_BPS = 500;       // 5% platform fee (basis points)
-    uint256 public constant BPS_DENOMINATOR   = 10_000;
-    uint256 public constant MAX_SCORE         = 100;
-    uint256 public constant MIN_STAKE         = 0.001 ether;
-    uint256 public constant MAX_STAKE         = 10 ether;
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // STATE
-    // ─────────────────────────────────────────────────────────────────────────────
-
+    // Keep the existing round/entry tuple shapes stable for readers.
     struct Round {
         uint256 id;
         uint256 startTime;
-        uint256 endTime;           // submission deadline
-        uint256 judgingDeadline;   // after this, unclaimed stakes refundable
-        uint256 stakeAmount;       // fixed stake per round
-        uint256 scoreTolerance;    // e.g. 5 means ±5 points
+        uint256 endTime;
+        uint256 judgingDeadline;
+        uint256 stakeAmount;
+        uint256 scoreTolerance;
         uint256 totalPool;
         uint256 platformFeePool;
         uint256 winnersCount;
-        bool    isActive;
-        bool    feesWithdrawn;
+        bool isActive;
+        bool feesWithdrawn;
     }
 
     struct Entry {
         address participant;
         uint256 roundId;
-        uint256 selfScore;         // 0–100 declared by user
-        uint256 verifiedScore;     // set by trusted agent
-        string  githubUrl;
-        string  websiteUrl;
-        string  proofIpfsHash;     // IPFS hash of agent report
-        bool    scored;
-        bool    claimed;
-        bool    isWinner;
+        uint256 selfScore;
+        uint256 verifiedScore;
+        string githubUrl;
+        string websiteUrl;
+        string proofIpfsHash;
+        bool scored;
+        bool claimed;
+        bool isWinner;
     }
 
-    // Round storage
+    struct Settlement {
+        uint256 scoredEntries;
+        uint256 scoredPool;
+        uint256 winnerShare;
+        uint256 claimedWinners;
+        bool finalized;
+        bool refundAll;
+    }
+
     uint256 public currentRoundId;
-    mapping(uint256 => Round) public rounds;
-
-    // Entry storage
     uint256 public entryCounter;
-    mapping(uint256 => Entry) public entries;                                // entryId => Entry
-    mapping(uint256 => uint256[]) public roundEntries;                       // roundId => entryIds[]
-    mapping(uint256 => mapping(address => uint256)) public roundParticipant; // roundId => addr => latest entryId
-    mapping(uint256 => mapping(address => uint256[])) private roundParticipantEntries; // roundId => addr => all entryIds
-
-    // Trusted agent addresses (can submit verified scores)
+    mapping(uint256 => Round) public rounds;
+    mapping(uint256 => Entry) public entries;
+    mapping(uint256 => Settlement) public settlements;
+    mapping(uint256 => uint256[]) public roundEntries;
+    mapping(uint256 => mapping(address => uint256)) public roundParticipant;
+    mapping(uint256 => mapping(address => uint256[])) private participantEntries;
     mapping(address => bool) public trustedAgents;
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // EVENTS
-    // ─────────────────────────────────────────────────────────────────────────────
 
     event RoundCreated(uint256 indexed roundId, uint256 stakeAmount, uint256 tolerance, uint256 endTime);
     event EntrySubmitted(uint256 indexed entryId, uint256 indexed roundId, address indexed participant, uint256 selfScore);
     event ScoreVerified(uint256 indexed entryId, uint256 verifiedScore, bool isWinner, string proofHash);
+    event RoundFinalized(uint256 indexed roundId, uint256 scoredPool, uint256 winnerShare, bool refundAll);
     event PrizeClaimed(uint256 indexed entryId, address indexed participant, uint256 amount);
     event RefundClaimed(uint256 indexed entryId, address indexed participant, uint256 amount);
     event AgentUpdated(address indexed agent, bool trusted);
     event PlatformFeesWithdrawn(uint256 indexed roundId, uint256 amount);
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // ERRORS
-    // ─────────────────────────────────────────────────────────────────────────────
-
     error RoundNotActive();
     error RoundStillOpen();
+    error RoundNotFound();
+    error EntryNotFound();
     error SubmissionClosed();
+    error ScoringClosed();
     error InvalidScore();
     error WrongStakeAmount(uint256 required, uint256 sent);
     error NotScored();
     error AlreadyClaimed();
     error NotWinner();
+    error NotParticipant();
     error NotTrustedAgent();
     error EntryAlreadyScored();
     error JudgingNotExpired();
     error InvalidUrl();
+    error InvalidProof();
+    error InvalidAgent();
     error FeesAlreadyWithdrawn();
     error InvalidRoundTiming();
     error NoWinnersInRound();
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // MODIFIERS
-    // ─────────────────────────────────────────────────────────────────────────────
+    error InvalidPageSize();
+    error TransferFailed();
 
     modifier onlyTrustedAgent() {
         if (!trustedAgents[msg.sender]) revert NotTrustedAgent();
         _;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // CONSTRUCTOR
-    // ─────────────────────────────────────────────────────────────────────────────
-
     constructor(address initialOwner) Ownable(initialOwner) {
-        // Owner is also a trusted agent by default
         trustedAgents[initialOwner] = true;
         emit AgentUpdated(initialOwner, true);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // ADMIN: ROUND MANAGEMENT
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    /**
-     * @notice Create a new game round
-     * @param stakeAmount   ETH each participant must stake (in wei)
-     * @param scoreTolerance Points window for a "win" (e.g. 5 = ±5)
-     * @param durationSecs  How long submissions are open (seconds)
-     * @param judgingBuffer Extra seconds after close before refunds unlock
-     */
     function createRound(
         uint256 stakeAmount,
         uint256 scoreTolerance,
         uint256 durationSecs,
         uint256 judgingBuffer
     ) external onlyOwner whenNotPaused {
-        if (stakeAmount < MIN_STAKE || stakeAmount > MAX_STAKE) revert WrongStakeAmount(MIN_STAKE, stakeAmount);
-        if (scoreTolerance > 20) revert InvalidScore();  // cap tolerance at 20 pts
+        if (stakeAmount < MIN_STAKE || stakeAmount > MAX_STAKE) {
+            revert WrongStakeAmount(MIN_STAKE, stakeAmount);
+        }
+        if (scoreTolerance > 20) revert InvalidScore();
         if (durationSecs == 0 || judgingBuffer == 0) revert InvalidRoundTiming();
-
-        // Mark previous round inactive
-        if (currentRoundId > 0) {
+        // An owner cannot silently end an open submission window by replacing it.
+        if (currentRoundId != 0) {
+            if (block.timestamp < rounds[currentRoundId].endTime) revert RoundStillOpen();
             rounds[currentRoundId].isActive = false;
         }
-
-        currentRoundId++;
-        uint256 endTime       = block.timestamp + durationSecs;
-        uint256 judgingDeadline = endTime + judgingBuffer;
-
-        rounds[currentRoundId] = Round({
-            id:              currentRoundId,
-            startTime:       block.timestamp,
-            endTime:         endTime,
-            judgingDeadline: judgingDeadline,
-            stakeAmount:     stakeAmount,
-            scoreTolerance:  scoreTolerance,
-            totalPool:       0,
+        uint256 roundId = ++currentRoundId;
+        uint256 endTime = block.timestamp + durationSecs;
+        rounds[roundId] = Round({
+            id: roundId,
+            startTime: block.timestamp,
+            endTime: endTime,
+            judgingDeadline: endTime + judgingBuffer,
+            stakeAmount: stakeAmount,
+            scoreTolerance: scoreTolerance,
+            totalPool: 0,
             platformFeePool: 0,
-            winnersCount:    0,
-            isActive:        true,
-            feesWithdrawn:   false
+            winnersCount: 0,
+            isActive: true,
+            feesWithdrawn: false
         });
-
-        emit RoundCreated(currentRoundId, stakeAmount, scoreTolerance, endTime);
+        emit RoundCreated(roundId, stakeAmount, scoreTolerance, endTime);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // PLAYER: ENTER GAME
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    /**
-     * @notice Enter the current active round
-     * @param selfScore  Your declared score (0–100)
-     * @param githubUrl  Link to your GitHub repo
-     * @param websiteUrl Link to your live website
-     */
     function enterGame(
         uint256 selfScore,
         string calldata githubUrl,
         string calldata websiteUrl
     ) external payable nonReentrant whenNotPaused {
-        uint256 roundId = currentRoundId;
-        Round storage round = rounds[roundId];
+        Round storage round = rounds[currentRoundId];
+        if (!round.isActive) revert RoundNotActive();
+        if (block.timestamp >= round.endTime) revert SubmissionClosed();
+        if (selfScore > MAX_SCORE) revert InvalidScore();
+        if (msg.value != round.stakeAmount) revert WrongStakeAmount(round.stakeAmount, msg.value);
+        if (
+            bytes(githubUrl).length == 0 ||
+            bytes(githubUrl).length > MAX_URL_BYTES ||
+            bytes(websiteUrl).length > MAX_URL_BYTES
+        ) revert InvalidUrl();
 
-        if (!round.isActive)                           revert RoundNotActive();
-        if (block.timestamp > round.endTime)           revert SubmissionClosed();
-        if (selfScore > MAX_SCORE)                     revert InvalidScore();
-        if (msg.value != round.stakeAmount)            revert WrongStakeAmount(round.stakeAmount, msg.value);
-        if (bytes(githubUrl).length == 0 || bytes(websiteUrl).length == 0) revert InvalidUrl();
-
-        entryCounter++;
-        uint256 entryId = entryCounter;
-
+        uint256 entryId = ++entryCounter;
         entries[entryId] = Entry({
-            participant:    msg.sender,
-            roundId:        roundId,
-            selfScore:      selfScore,
-            verifiedScore:  0,
-            githubUrl:      githubUrl,
-            websiteUrl:     websiteUrl,
-            proofIpfsHash:  "",
-            scored:         false,
-            claimed:        false,
-            isWinner:       false
+            participant: msg.sender,
+            roundId: round.id,
+            selfScore: selfScore,
+            verifiedScore: 0,
+            githubUrl: githubUrl,
+            websiteUrl: websiteUrl,
+            proofIpfsHash: "",
+            scored: false,
+            claimed: false,
+            isWinner: false
         });
-
-        roundEntries[roundId].push(entryId);
-        roundParticipant[roundId][msg.sender] = entryId; // keep latest for backward compatibility
-        roundParticipantEntries[roundId][msg.sender].push(entryId);
-
-        // Platform fee is deducted from pool at scoring time; track gross for now
+        roundEntries[round.id].push(entryId);
+        roundParticipant[round.id][msg.sender] = entryId;
+        participantEntries[round.id][msg.sender].push(entryId);
         round.totalPool += msg.value;
-
-        emit EntrySubmitted(entryId, roundId, msg.sender, selfScore);
+        emit EntrySubmitted(entryId, round.id, msg.sender, selfScore);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // AGENT: SUBMIT VERIFIED SCORE
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    /**
-     * @notice Submit AI agent's verified score for an entry
-     * @param entryId       The entry being judged
-     * @param verifiedScore Score computed by the agent (0–100)
-     * @param proofIpfsHash IPFS hash of the full agent report
-     */
     function submitVerifiedScore(
         uint256 entryId,
         uint256 verifiedScore,
         string calldata proofIpfsHash
     ) external onlyTrustedAgent nonReentrant {
-        Entry storage entry = entries[entryId];
+        Entry storage entry = _entry(entryId);
         Round storage round = rounds[entry.roundId];
-
-        if (entry.participant == address(0)) revert NotScored(); // entry doesn't exist
-        if (entry.scored)                    revert EntryAlreadyScored();
-        if (verifiedScore > MAX_SCORE)       revert InvalidScore();
-
-        entry.verifiedScore  = verifiedScore;
-        entry.proofIpfsHash  = proofIpfsHash;
-        entry.scored         = true;
-
-        // Determine winner: |selfScore - verifiedScore| <= tolerance
+        if (entry.claimed) revert AlreadyClaimed();
+        if (entry.scored) revert EntryAlreadyScored();
+        if (settlements[round.id].finalized || block.timestamp > round.judgingDeadline) {
+            revert ScoringClosed();
+        }
+        if (verifiedScore > MAX_SCORE) revert InvalidScore();
+        if (bytes(proofIpfsHash).length == 0 || bytes(proofIpfsHash).length > MAX_PROOF_BYTES) {
+            revert InvalidProof();
+        }
+        entry.verifiedScore = verifiedScore;
+        entry.proofIpfsHash = proofIpfsHash;
+        entry.scored = true;
         uint256 diff = entry.selfScore > verifiedScore
             ? entry.selfScore - verifiedScore
             : verifiedScore - entry.selfScore;
-
-        bool isWinner = diff <= round.scoreTolerance;
-        entry.isWinner = isWinner;
-
-        if (isWinner) {
-            round.winnersCount++;
-        }
-
-        emit ScoreVerified(entryId, verifiedScore, isWinner, proofIpfsHash);
+        entry.isWinner = diff <= round.scoreTolerance;
+        settlements[round.id].scoredEntries++;
+        if (entry.isWinner) round.winnersCount++;
+        emit ScoreVerified(entryId, verifiedScore, entry.isWinner, proofIpfsHash);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // PLAYER: CLAIM PRIZE
-    // ─────────────────────────────────────────────────────────────────────────────
-
     /**
-     * @notice Winners call this to receive their share of the prize pool
-     * @param entryId The winning entry ID
+     * @notice Anyone can finalize after submissions close and all entries are
+     * judged, or after the judging deadline. Repeated calls are harmless.
      */
-    function claimPrize(uint256 entryId) external nonReentrant whenNotPaused {
-        Entry storage entry = entries[entryId];
-        Round storage round = rounds[entry.roundId];
-
-        if (entry.participant != msg.sender)  revert NotTrustedAgent(); // wrong caller
-        if (!entry.scored)                    revert NotScored();
-        if (entry.claimed)                    revert AlreadyClaimed();
-        if (!entry.isWinner)                  revert NotWinner();
-        if (round.winnersCount == 0)          revert NoWinnersInRound();
-
-        entry.claimed = true;
-
-        // Calculate prize: total pool minus platform fee, split equally among winners
-        uint256 fee       = (round.totalPool * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
-        uint256 prizePool = round.totalPool - fee;
-        uint256 share     = prizePool / round.winnersCount;
-
-        // Track fees (only first winner triggers fee accounting, rest just split)
-        if (round.platformFeePool == 0) {
-            round.platformFeePool = fee;
-        }
-
-        (bool success, ) = payable(msg.sender).call{value: share}("");
-        require(success, "Transfer failed");
-
-        emit PrizeClaimed(entryId, msg.sender, share);
+    function finalizeRound(uint256 roundId) external nonReentrant {
+        _finalize(roundId);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // PLAYER: CLAIM REFUND (if not scored before judging deadline)
-    // ─────────────────────────────────────────────────────────────────────────────
+    function _finalize(uint256 roundId) private {
+        Round storage round = _round(roundId);
+        Settlement storage settlement = settlements[roundId];
+        if (settlement.finalized) return;
+        if (block.timestamp < round.endTime) revert RoundStillOpen();
+        if (
+            settlement.scoredEntries != roundEntries[roundId].length &&
+            block.timestamp <= round.judgingDeadline
+        ) revert JudgingNotExpired();
+
+        settlement.finalized = true;
+        round.isActive = false;
+        settlement.scoredPool = settlement.scoredEntries * round.stakeAmount;
+        settlement.refundAll = round.winnersCount == 0;
+        if (!settlement.refundAll) {
+            uint256 fee = settlement.scoredPool * PLATFORM_FEE_BPS / BPS_DENOMINATOR;
+            uint256 net = settlement.scoredPool - fee;
+            settlement.winnerShare = net / round.winnersCount;
+            // Division dust is less than one wei per winner and is accounted
+            // with the fee so it cannot remain permanently locked.
+            round.platformFeePool = fee + net % round.winnersCount;
+        }
+        emit RoundFinalized(roundId, settlement.scoredPool, settlement.winnerShare, settlement.refundAll);
+    }
+
+    // Exits deliberately remain available while new entries are paused.
+    function claimPrize(uint256 entryId) external nonReentrant {
+        Entry storage entry = _entry(entryId);
+        if (entry.participant != msg.sender) revert NotParticipant();
+        if (entry.claimed) revert AlreadyClaimed();
+        if (!entry.scored) revert NotScored();
+        if (!entry.isWinner) revert NotWinner();
+        _finalize(entry.roundId);
+        entry.claimed = true;
+        Settlement storage settlement = settlements[entry.roundId];
+        settlement.claimedWinners++;
+        uint256 amount = settlement.winnerShare;
+        _send(msg.sender, amount);
+        emit PrizeClaimed(entryId, msg.sender, amount);
+    }
 
     /**
-     * @notice If agent hasn't scored your entry before judgingDeadline, reclaim your stake
+     * @notice Unjudged entries reclaim their whole stake after the judging
+     * deadline. If nobody won, every entry reclaims its whole stake without fee.
      */
     function claimRefund(uint256 entryId) external nonReentrant {
-        Entry storage entry = entries[entryId];
-        Round storage round = rounds[entry.roundId];
-
-        if (entry.participant != msg.sender) revert NotTrustedAgent();
-        if (entry.claimed)                   revert AlreadyClaimed();
-        if (entry.scored)                    revert EntryAlreadyScored(); // scored = no refund path
-        if (block.timestamp <= round.judgingDeadline) revert JudgingNotExpired();
-
+        Entry storage entry = _entry(entryId);
+        if (entry.participant != msg.sender) revert NotParticipant();
+        if (entry.claimed) revert AlreadyClaimed();
+        _finalize(entry.roundId);
+        Settlement storage settlement = settlements[entry.roundId];
+        if (!settlement.refundAll && entry.scored) revert EntryAlreadyScored();
         entry.claimed = true;
+        Round storage round = rounds[entry.roundId];
         round.totalPool -= round.stakeAmount;
-
-        (bool success, ) = payable(msg.sender).call{value: round.stakeAmount}("");
-        require(success, "Refund failed");
-
+        _send(msg.sender, round.stakeAmount);
         emit RefundClaimed(entryId, msg.sender, round.stakeAmount);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // ADMIN: WITHDRAW PLATFORM FEES
-    // ─────────────────────────────────────────────────────────────────────────────
-
     function withdrawPlatformFees(uint256 roundId) external onlyOwner nonReentrant {
+        _finalize(roundId);
         Round storage round = rounds[roundId];
         if (round.feesWithdrawn) revert FeesAlreadyWithdrawn();
         if (round.platformFeePool == 0) revert NoWinnersInRound();
-
         round.feesWithdrawn = true;
-        uint256 amount = round.platformFeePool;
-
-        (bool success, ) = payable(owner()).call{value: amount}("");
-        require(success, "Fee withdrawal failed");
-
-        emit PlatformFeesWithdrawn(roundId, amount);
+        _send(owner(), round.platformFeePool);
+        emit PlatformFeesWithdrawn(roundId, round.platformFeePool);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // ADMIN: AGENT MANAGEMENT
-    // ─────────────────────────────────────────────────────────────────────────────
-
     function setTrustedAgent(address agent, bool trusted) external onlyOwner {
+        if (agent == address(0)) revert InvalidAgent();
         trustedAgents[agent] = trusted;
         emit AgentUpdated(agent, trusted);
     }
 
-    function pause()   external onlyOwner { _pause(); }
+    function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // VIEWS
-    // ─────────────────────────────────────────────────────────────────────────────
-
     function getRound(uint256 roundId) external view returns (Round memory) {
-        return rounds[roundId];
+        return _round(roundId);
     }
 
     function getEntry(uint256 entryId) external view returns (Entry memory) {
-        return entries[entryId];
+        return _entry(entryId);
+    }
+
+    function getSettlement(uint256 roundId) external view returns (Settlement memory) {
+        _round(roundId);
+        return settlements[roundId];
     }
 
     function getRoundEntries(uint256 roundId) external view returns (uint256[] memory) {
+        _round(roundId);
         return roundEntries[roundId];
     }
 
-    // Backward-compatible: returns latest entry for a participant in a round.
+    function getRoundEntriesPage(
+        uint256 roundId, uint256 offset, uint256 limit
+    ) external view returns (uint256[] memory page, uint256 total) {
+        _round(roundId);
+        if (limit == 0 || limit > MAX_PAGE_SIZE) revert InvalidPageSize();
+        uint256[] storage ids = roundEntries[roundId];
+        total = ids.length;
+        if (offset >= total) return (new uint256[](0), total);
+        uint256 length = total - offset;
+        if (length > limit) length = limit;
+        page = new uint256[](length);
+        for (uint256 i; i < length; ++i) page[i] = ids[offset + i];
+    }
+
     function getMyEntry(uint256 roundId, address participant) external view returns (uint256) {
         return roundParticipant[roundId][participant];
     }
 
-    // New helper: returns all entries by a participant in a round.
     function getMyEntries(uint256 roundId, address participant) external view returns (uint256[] memory) {
-        return roundParticipantEntries[roundId][participant];
+        return participantEntries[roundId][participant];
+    }
+
+    function previewSettlement(uint256 roundId) public view returns (
+        bool ready, uint256 winnerShare, uint256 fee, bool refundAll
+    ) {
+        Round storage round = _round(roundId);
+        Settlement storage settlement = settlements[roundId];
+        if (settlement.finalized) {
+            return (true, settlement.winnerShare, round.platformFeePool, settlement.refundAll);
+        }
+        ready = block.timestamp >= round.endTime && (
+            settlement.scoredEntries == roundEntries[roundId].length ||
+            block.timestamp > round.judgingDeadline
+        );
+        refundAll = round.winnersCount == 0;
+        if (!refundAll) {
+            uint256 pool = settlement.scoredEntries * round.stakeAmount;
+            fee = pool * PLATFORM_FEE_BPS / BPS_DENOMINATOR;
+            uint256 net = pool - fee;
+            winnerShare = net / round.winnersCount;
+            fee += net % round.winnersCount;
+        }
     }
 
     function getPrizePool(uint256 roundId) external view returns (uint256 gross, uint256 net, uint256 fee) {
-        Round memory r = rounds[roundId];
-        fee  = (r.totalPool * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
-        net  = r.totalPool - fee;
-        gross = r.totalPool;
+        Round storage round = _round(roundId);
+        gross = round.totalPool;
+        (, , fee, ) = previewSettlement(roundId);
+        uint256 pool = settlements[roundId].scoredEntries * round.stakeAmount;
+        net = round.winnersCount == 0 ? 0 : pool - fee;
     }
 
     function getWinnerShare(uint256 roundId) external view returns (uint256) {
-        Round memory r = rounds[roundId];
-        if (r.winnersCount == 0) return 0;
-        uint256 fee      = (r.totalPool * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
-        uint256 prizePool = r.totalPool - fee;
-        return prizePool / r.winnersCount;
+        (bool ready, uint256 share, , ) = previewSettlement(roundId);
+        return ready ? share : 0;
     }
 
-    // Safety: reject accidental ETH sends
+    function _entry(uint256 entryId) private view returns (Entry storage entry) {
+        entry = entries[entryId];
+        if (entry.participant == address(0)) revert EntryNotFound();
+    }
+
+    function _round(uint256 roundId) private view returns (Round storage round) {
+        round = rounds[roundId];
+        if (round.id == 0) revert RoundNotFound();
+    }
+
+    function _send(address recipient, uint256 amount) private {
+        (bool success, ) = payable(recipient).call{value: amount}("");
+        if (!success) revert TransferFailed();
+    }
+
     receive() external payable { revert("Use enterGame()"); }
 }
